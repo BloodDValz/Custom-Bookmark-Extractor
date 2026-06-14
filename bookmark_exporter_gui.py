@@ -11,7 +11,7 @@ The bookmark name/title is NOT used for matching — only the link address (href
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from collections import defaultdict
+from collections import defaultdict, deque
 from html.parser import HTMLParser
 from typing import List, Optional, TypedDict
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -369,6 +369,12 @@ class BookmarkExtractorApp(tk.Tk):
         self.bind_all("<Control-E>", lambda e: self._dispatch_shortcut("export"))
         self.bind_all("<Control-f>", lambda e: self._dispatch_shortcut("focus_filter"))
         self.bind_all("<Control-F>", lambda e: self._dispatch_shortcut("focus_filter"))
+        self.bind_all("<Control-z>", lambda e: self._dispatch_shortcut("undo"))
+        self.bind_all("<Control-Z>", lambda e: self._dispatch_shortcut("undo"))
+        self.bind_all("<Control-y>", lambda e: self._dispatch_shortcut("redo"))
+        self.bind_all("<Control-Y>", lambda e: self._dispatch_shortcut("redo"))
+        self.bind_all("<Control-g>", lambda e: self._dispatch_shortcut("jump_to_folder"))
+        self.bind_all("<Control-G>", lambda e: self._dispatch_shortcut("jump_to_folder"))
 
     def _dispatch_shortcut(self, action):
         frame = {
@@ -400,9 +406,25 @@ class NormalModeFrame(ttk.Frame):
         self._check_vars  = {}   # iid → BooleanVar  ("checked" = fully checked)
         self._all_checked = True # global toggle state for heading click
 
+        # Undo / Redo stacks (unlimited depth)
+        self._undo_stack: deque = deque()
+        self._redo_stack: deque = deque()
+
+        # folder iid → direct bookmark count (for statistics label)
+        self._folder_bm_counts: dict = {}
+
+        # Active filters dict — populated by the filter dialog
+        # Keys: "type" ("bookmark"|"folder"|None), "date_after" (int|None),
+        #       "date_before" (int|None), "folders" (list of node refs|None)
+        self._active_filters: dict = {
+            "type": None, "date_after": None,
+            "date_before": None, "folders": None,
+        }
+
         # Drag-to-reorder state
         self._drag_locked      = True
         self._drag_iid         = None
+        self._drag_iids        = []     # all items being dragged (multi-select)
         self._drag_prev_target = None
         self._drag_prev_folder = None
         self._ghost            = None   # created lazily on first drag
@@ -437,9 +459,51 @@ class NormalModeFrame(ttk.Frame):
                    command=self._select_all).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(toolbar, text="⊟ Deselect All", style="Ghost.TButton",
                    command=self._deselect_all).pack(side=tk.RIGHT, padx=(4, 0))
+        self._expand_all_state = False
+        self._expand_all_btn = ttk.Button(toolbar, text="⊞ Expand All", style="Ghost.TButton",
+                   command=self._toggle_expand_all)
+        self._expand_all_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        self._expand_sub_state = False
+        self._expand_sub_btn = ttk.Button(toolbar, text="⊞ Expand Subfolders", style="Ghost.TButton",
+                   command=self._toggle_expand_subfolders)
+        self._expand_sub_btn.pack(side=tk.RIGHT, padx=(4, 0))
+
+        # ── Second toolbar row: Undo / Redo / Bulk Rename ───────────────────
+        toolbar2 = ttk.Frame(self, style="App.TFrame")
+        toolbar2.pack(fill=tk.X, pady=(0, 4))
+
+        self._undo_btn = ttk.Button(toolbar2, text="↷ Undo", style="Ghost.TButton",
+                   command=self._undo)
+        self._undo_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._undo_btn.config(state=tk.DISABLED)
+
+        self._redo_btn = ttk.Button(toolbar2, text="↶ Redo", style="Ghost.TButton",
+                   command=self._redo)
+        self._redo_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._redo_btn.config(state=tk.DISABLED)
+
+        ttk.Button(toolbar2, text="✎ Bulk Rename", style="Ghost.TButton",
+                   command=self._open_bulk_rename).pack(side=tk.LEFT, padx=(0, 4))
+
+        ttk.Button(toolbar2, text="⌖ Jump to Folder", style="Ghost.TButton",
+                   command=self._open_jump_to_folder).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._filter_btn = ttk.Button(toolbar2, text="⊿ Filter", style="Ghost.TButton",
+                   command=self._open_filter_dialog)
+        self._filter_btn.pack(side=tk.RIGHT, padx=(4, 0))
+
+        # ── Active-filter indicator bar (hidden until a filter is set) ───────
+        self._filter_bar = tk.Frame(self, bg=c["bg"])
+        # not packed yet — shown dynamically by _refresh_filter_bar
+        self._filter_bar_inner = tk.Frame(self._filter_bar, bg=c["bg"])
+        self._filter_bar_inner.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(self._filter_bar, text="✕ Clear All", bg=c["bg"], fg=c["danger"],
+                  font=("Segoe UI", 8), relief="flat", bd=0, cursor="hand2",
+                  command=self._clear_all_filters).pack(side=tk.RIGHT, padx=(0, 4))
 
         sf = ttk.Frame(self, style="App.TFrame")
         sf.pack(fill=tk.X, pady=(0, 8))
+        self._search_bar_frame = sf
         self._search_lbl = tk.Label(sf, text="⌕  Search:", bg=c["bg"], fg=c["subtext"],
                  font=("Courier New", 10))
         self._search_lbl.pack(side=tk.LEFT, padx=(0, 6))
@@ -467,6 +531,24 @@ class NormalModeFrame(ttk.Frame):
         ttk.Label(th, text="BOOKMARK TREE", style="PanelSub.TLabel").pack(side=tk.LEFT)
         self._count_label = ttk.Label(th, text="", style="PanelSub.TLabel")
         self._count_label.pack(side=tk.RIGHT)
+
+        # ── Breadcrumb bar (scrollable, clickable segments) ──────────────────
+        bc_frame = tk.Frame(tree_outer, bg=c["sel"])
+        bc_frame.pack(fill=tk.X, padx=4, pady=(0, 2))
+        self._bc_canvas = tk.Canvas(bc_frame, bg=c["sel"], height=22,
+                                    highlightthickness=0, bd=0)
+        self._bc_canvas.pack(fill=tk.X, expand=True)
+        self._bc_inner = tk.Frame(self._bc_canvas, bg=c["sel"])
+        self._bc_canvas_win = self._bc_canvas.create_window(
+            (0, 0), window=self._bc_inner, anchor="nw")
+        self._bc_inner.bind("<Configure>",
+            lambda e: self._bc_canvas.configure(
+                scrollregion=self._bc_canvas.bbox("all")))
+        self._bc_frame = bc_frame
+        def _bc_scroll(event):
+            self._bc_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._bc_canvas.bind("<MouseWheel>", _bc_scroll)
+        self._bc_inner.bind("<MouseWheel>",  _bc_scroll)
 
         tf = ttk.Frame(tree_outer, style="Panel.TFrame")
         tf.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -496,7 +578,13 @@ class NormalModeFrame(ttk.Frame):
         self._tree.bind("<ButtonPress-1>",   self._on_button_press)
         self._tree.bind("<B1-Motion>",       self._on_drag_motion)
         self._tree.bind("<ButtonRelease-1>", self._on_drag_release)
-        self._tree.bind("<<TreeviewSelect>>", lambda e: self._update_info())
+        self._tree.bind("<<TreeviewSelect>>", lambda e: (self._update_info(), self._update_breadcrumb()))
+        self._tree.bind("<space>", self._on_space_toggle)
+        self._tree.bind("<Control-a>", self._on_ctrl_a)
+        self._tree.bind("<Shift-Up>",   self._on_shift_up)
+        self._tree.bind("<Shift-Down>", self._on_shift_down)
+        self._tree.bind("<Up>",   self._on_plain_up)
+        self._tree.bind("<Down>", self._on_plain_down)
 
         # Tags for drag visuals
         self._tree.tag_configure("drag_folder",    background="#dbeafe", foreground=c["text"])
@@ -550,7 +638,11 @@ class NormalModeFrame(ttk.Frame):
     def _on_file_loaded(self, path, root):
         self._parsed_root = root
         self._file_label.config(text=os.path.basename(path))
+        self._undo_stack.clear()
+        self._redo_stack.clear()
         self._populate_tree(self._parsed_root)
+        self._reset_expand_btns()
+        self._refresh_undo_btns()
 
     # ── Tree population ───────────────────────
 
@@ -558,6 +650,7 @@ class NormalModeFrame(ttk.Frame):
         self._tree.delete(*self._tree.get_children())
         self._node_map.clear()
         self._check_vars.clear()
+        self._folder_bm_counts.clear()
 
         total = count_bookmarks(root.get("children", []))
 
@@ -565,17 +658,23 @@ class NormalModeFrame(ttk.Frame):
             for node in nodes:
                 if search_term and not self._node_matches(node, search_term):
                     continue
+                if not self._node_passes_filter(node):
+                    continue
                 name  = node.get("name") or "(unnamed)"
                 ntype = node["type"]
-                icon  = "📁" if ntype == "folder" else "🔖"
-                var   = tk.BooleanVar(value=True)
-                iid   = self._tree.insert(parent_iid, "end",
-                            text=f"  {icon}  {name}",
+                if ntype == "folder":
+                    bm_count = count_bookmarks(node.get("children", []))
+                    icon_lbl = f"  📁  {name} ({bm_count})"
+                else:
+                    icon_lbl = f"  🔖  {name}"
+                iid = self._tree.insert(parent_iid, "end",
+                            text=icon_lbl,
                             values=("☑", ntype),
                             open=not bool(search_term))
-                self._node_map[iid]   = node
-                self._check_vars[iid] = var
+                self._node_map[iid] = node
+                self._check_vars[iid] = tk.BooleanVar(value=True)
                 if ntype == "folder":
+                    self._folder_bm_counts[iid] = bm_count
                     insert(iid, node.get("children", []))
 
         insert("", root.get("children", []))
@@ -584,14 +683,146 @@ class NormalModeFrame(ttk.Frame):
         self._status_var.set(f"Loaded: {total} bookmarks")
         self._all_checked = True
         self._update_info()
+        self._update_breadcrumb()
 
     def _node_matches(self, node, term):
-        term = term.lower()
+        """Check if node (or any descendant) matches the already-lowercased term."""
         if term in (node.get("name") or "").lower() or term in (node.get("href") or "").lower():
             return True
         if node["type"] == "folder":
             return any(self._node_matches(c, term) for c in node.get("children", []))
         return False
+
+    # ── Undo / Redo engine ───────────────────────────
+
+    def _snapshot(self):
+        """Capture a serialisable snapshot of the full tree state."""
+        def snap_iid(iid):
+            node = self._node_map.get(iid, {})
+            var  = self._check_vars.get(iid)
+            sibs = list(self._tree.get_children(self._tree.parent(iid)))
+            return {
+                "iid":      iid,
+                "parent":   self._tree.parent(iid),
+                "index":    sibs.index(iid) if iid in sibs else 0,
+                "checked":  var.get() if var else True,
+                "symbol":   (self._tree.item(iid, "values") or ["☑"])[0],
+                "name":     node.get("name", ""),
+                "href":     node.get("href", ""),
+                "children": [snap_iid(c) for c in self._tree.get_children(iid)],
+            }
+        return [snap_iid(iid) for iid in self._tree.get_children("")]
+
+    def _push_undo(self, snapshot=None):
+        """Push current state onto undo stack (call BEFORE making a change)."""
+        if snapshot is None:
+            snapshot = self._snapshot()
+        self._undo_stack.append(snapshot)
+        self._redo_stack.clear()
+        self._refresh_undo_btns()
+
+    def _restore_snapshot(self, snapshot):
+        """Restore tree to a previously captured snapshot."""
+        def restore_children(parent_iid, items):
+            for i, s in enumerate(items):
+                iid = s["iid"]
+                if iid not in self._node_map:
+                    continue
+                self._tree.move(iid, parent_iid, i)
+                var = self._check_vars.get(iid)
+                if var:
+                    var.set(s["checked"])
+                vals  = self._tree.item(iid, "values")
+                ntype = vals[1] if len(vals) > 1 else self._node_map[iid].get("type", "")
+                self._tree.item(iid, values=(s["symbol"], ntype))
+                node = self._node_map.get(iid)
+                if node:
+                    node["name"] = s["name"]
+                    node["href"] = s["href"]
+                    if node["type"] == "folder":
+                        cnt = self._folder_bm_counts.get(iid, count_bookmarks(node.get("children", [])))
+                        self._tree.item(iid, text=f"  📁  {s['name']} ({cnt})")
+                    else:
+                        self._tree.item(iid, text=f"  🔖  {s['name']}")
+                restore_children(iid, s["children"])
+        restore_children("", snapshot)
+        self._refresh_folder_indicators()
+        self._update_info()
+
+    def _undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        self._restore_snapshot(self._undo_stack.pop())
+        self._refresh_undo_btns()
+
+    def _redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        self._restore_snapshot(self._redo_stack.pop())
+        self._refresh_undo_btns()
+
+    def _refresh_undo_btns(self):
+        self._undo_btn.config(state=tk.NORMAL if self._undo_stack else tk.DISABLED)
+        self._redo_btn.config(state=tk.NORMAL if self._redo_stack else tk.DISABLED)
+
+    # ── Expand / Collapse ─────────────────────
+
+    def _tree_is_expanded(self):
+        """Return True if any non-top-level folder is currently open."""
+        def any_open(iid, depth):
+            for child in self._tree.get_children(iid):
+                if self._node_map.get(child, {}).get("type") == "folder":
+                    if depth > 0 and self._tree.item(child, "open"):
+                        return True
+                    if any_open(child, depth + 1):
+                        return True
+            return False
+        return any_open("", 0)
+
+    def _tree_all_expanded(self):
+        """Return True if every folder in the tree is open."""
+        def all_open(iid):
+            for child in self._tree.get_children(iid):
+                if self._node_map.get(child, {}).get("type") == "folder":
+                    if not self._tree.item(child, "open"):
+                        return False
+                    if not all_open(child):
+                        return False
+            return True
+        return all_open("")
+
+    def _reset_expand_btns(self):
+        """Sync button labels to actual tree state (call after load or manual expand)."""
+        self._expand_all_btn.config(text="⊞ Expand All")
+        self._expand_sub_btn.config(text="⊞ Expand Subfolders")
+
+    def _toggle_expand_all(self):
+        # Read actual state so manual tree clicks never desync the button
+        expanding = not self._tree_all_expanded()
+        self._expand_all_btn.config(
+            text="⊟ Collapse All" if expanding else "⊞ Expand All")
+        def walk(iid):
+            self._tree.item(iid, open=expanding)
+            for child in self._tree.get_children(iid):
+                walk(child)
+        for iid in self._tree.get_children(""):
+            walk(iid)
+
+    def _toggle_expand_subfolders(self):
+        # Read actual state so manual tree clicks never desync the button
+        expanding = not self._tree_is_expanded()
+        self._expand_sub_btn.config(
+            text="⊟ Collapse Subfolders" if expanding else "⊞ Expand Subfolders")
+        def walk(iid, depth):
+            for child_iid in self._tree.get_children(iid):
+                child_node = self._node_map.get(child_iid)
+                if child_node and child_node["type"] == "folder":
+                    if depth > 0:
+                        self._tree.item(child_iid, open=expanding)
+                    walk(child_iid, depth + 1)
+        walk("", 0)
 
     # ── Interaction ───────────────────────────
 
@@ -660,8 +891,12 @@ class NormalModeFrame(ttk.Frame):
                 pass
             self._drag_prev_folder = None
 
-    def _show_insertion_line(self, event_y, target_iid, drop_mode):
-        """Show a Chrome-style blue line between rows, or highlight a folder."""
+    def _show_insertion_line(self, event_y, target_iid, drop_mode, insert_parent=None, insert_idx=None):
+        """Show a Chrome-style blue line between rows, or highlight a folder.
+
+        insert_parent and insert_idx are pre-computed by _drop_info; if omitted
+        they are re-derived here (fallback for direct calls).
+        """
         tree = self._tree
 
         self._clear_drop_indicator()
@@ -672,21 +907,21 @@ class NormalModeFrame(ttk.Frame):
             self._drag_prev_folder = target_iid
             return
 
-        # Insert a zero-height blue separator item just before/after target_iid
-        bbox = tree.bbox(target_iid)
-        if not bbox:
-            return
-        item_mid = bbox[1] + bbox[3] // 2
-        insert_after = event_y >= item_mid   # True = insert AFTER target
-
-        parent = tree.parent(target_iid)
-        sibs   = list(tree.get_children(parent))
-        idx    = sibs.index(target_iid)
-        insert_idx = idx + 1 if insert_after else idx
+        # Use pre-computed position if available, otherwise derive it
+        if insert_parent is None or insert_idx is None:
+            bbox = tree.bbox(target_iid)
+            if not bbox:
+                return
+            item_mid = bbox[1] + bbox[3] // 2
+            insert_after = event_y >= item_mid
+            insert_parent = tree.parent(target_iid)
+            sibs = list(tree.get_children(insert_parent))
+            idx  = sibs.index(target_iid)
+            insert_idx = idx + 1 if insert_after else idx
 
         # Insert a dummy item styled as a solid blue bar
         self._indicator_iid = tree.insert(
-            parent, insert_idx,
+            insert_parent, insert_idx,
             text="─" * 120,   # wide dash line fills the row
             values=("", ""),
             tags=("drop_line",))
@@ -711,14 +946,48 @@ class NormalModeFrame(ttk.Frame):
 
         # Drag start — only when unlocked and clicking a real node.
         if self._drag_locked:
+            self._reset_sel_anchor()
             return
         if not iid or iid not in self._node_map:
             return
         self._drag_iid         = iid
         self._drag_prev_target = None
         self._drag_prev_folder = None
-        node = self._node_map[iid]
-        label = ("📁  " if node["type"] == "folder" else "🔖  ") + (node.get("name") or "(unnamed)")[:40]
+
+        # Collect all currently-selected items that are real nodes.
+        # If the clicked item isn't in the current selection, start fresh with just it.
+        current_sel = [s for s in self._tree.selection() if s in self._node_map]
+        if iid not in current_sel:
+            current_sel = [iid]
+            self._tree.selection_set(iid)
+
+        # Keep original tree order so the group lands in the same relative order.
+        all_iids = list(self._node_map.keys())
+        # Preserve order via a stable sort by tree position
+        def tree_index(i):
+            try:
+                parent = self._tree.parent(i)
+                sibs   = list(self._tree.get_children(parent))
+                return (parent, sibs.index(i))
+            except Exception:
+                return ("", 0)
+
+        # Build a flat in-order list using the tree's own traversal
+        ordered = []
+        def collect(p):
+            for child in self._tree.get_children(p):
+                if child in current_sel:
+                    ordered.append(child)
+                collect(child)
+        collect("")
+        self._drag_iids = ordered if ordered else [iid]
+
+        # Build the ghost label
+        if len(self._drag_iids) == 1:
+            node  = self._node_map[iid]
+            label = ("📁  " if node["type"] == "folder" else "🔖  ") + (node.get("name") or "(unnamed)")[:40]
+        else:
+            label = f"🔖  {len(self._drag_iids)} items selected"
 
         # Create ghost on first use
         if self._ghost is None:
@@ -733,7 +1002,7 @@ class NormalModeFrame(ttk.Frame):
             self._ghost_lbl.pack()
 
         self._ghost_lbl.config(text=label)
-        self._tree.selection_set(iid)
+        self._tree.selection_set(*self._drag_iids)
 
     # ── Auto-scroll helpers ──────────────────────────────────────────────
 
@@ -783,26 +1052,52 @@ class NormalModeFrame(ttk.Frame):
                 self._scroll_job = self.after(80, self._do_scroll)
 
         # ── Drop indicator ────────────────────────────────────────────────
-        # Skip the indicator item itself
+        # Skip the indicator item itself and any dragged item
+        drag_set   = set(self._drag_iids)
         target_iid = self._tree.identify_row(event.y)
-        if not target_iid or target_iid == self._drag_iid or target_iid == self._indicator_iid:
+        if not target_iid or target_iid in drag_set or target_iid == self._indicator_iid:
             return
 
-        _, _, drop_mode, highlight_iid = self._drop_info(event.y)
+        insert_parent, insert_idx, drop_mode, highlight_iid = self._drop_info(event.y)
         if drop_mode is None:
             self._clear_drop_indicator()
             return
 
-        self._show_insertion_line(event.y, highlight_iid, drop_mode)
+        self._show_insertion_line(event.y, highlight_iid, drop_mode, insert_parent, insert_idx)
 
     def _on_drag_release(self, event):
         if self._drag_locked or not self._drag_iid:
             return
 
         src            = self._drag_iid
-        indicator_iid  = self._indicator_iid   # capture before hide clears it
-        self._drag_iid = None
+        drag_iids      = list(self._drag_iids)   # ordered list of all items being moved
+        indicator_iid  = self._indicator_iid      # capture before hide clears it
+        self._drag_iid  = None
+        self._drag_iids = []
         self._hide_drag_ui()
+
+        def do_move(parent, idx):
+            """Move all dragged items to (parent, idx) in original relative order."""
+            self._push_undo()
+            # Filter out items that are ancestors/descendants conflicts — keep it simple:
+            # just skip any dragged item that IS the target parent.
+            items_to_move = [i for i in drag_iids if i != parent]
+            if not items_to_move:
+                return
+            # Insert items one by one; adjust idx as we go for same-parent items
+            # that come before the insertion point.
+            insert_at = idx
+            for item in items_to_move:
+                item_parent = self._tree.parent(item)
+                if item_parent == parent:
+                    sibs    = list(self._tree.get_children(parent))
+                    item_idx = sibs.index(item) if item in sibs else -1
+                    if 0 <= item_idx < insert_at:
+                        insert_at -= 1
+                self._tree.move(item, parent, insert_at)
+                insert_at += 1
+            self._tree.selection_set(*items_to_move)
+            self._tree.see(items_to_move[0])
 
         # If we had an indicator item, use its position directly
         if indicator_iid:
@@ -810,47 +1105,819 @@ class NormalModeFrame(ttk.Frame):
                 parent = self._tree.parent(indicator_iid)
                 sibs   = list(self._tree.get_children(parent))
                 idx    = sibs.index(indicator_iid)
-                # Adjust for the indicator being in the list
-                src_parent = self._tree.parent(src)
-                if src_parent == parent:
-                    src_idx = sibs.index(src)
-                    if src_idx < idx:
-                        idx -= 1
-                self._tree.move(src, parent, idx)
-                self._tree.selection_set(src)
-                self._tree.see(src)
+                do_move(parent, idx)
                 return
             except Exception:
                 pass
 
         # Fallback: use hit-test
         target_iid = self._tree.identify_row(event.y)
-        if not target_iid or target_iid == src or target_iid not in self._node_map:
-            self._tree.selection_set(src)
+        drag_set   = set(drag_iids)
+        if not target_iid or target_iid in drag_set or target_iid not in self._node_map:
+            self._tree.selection_set(*[i for i in drag_iids if i in self._node_map])
             return
 
         insert_parent, insert_idx, drop_mode, _ = self._drop_info(event.y)
         if drop_mode is None:
-            self._tree.selection_set(src)
+            self._tree.selection_set(*[i for i in drag_iids if i in self._node_map])
             return
 
-        src_parent = self._tree.parent(src)
-        if src_parent == insert_parent and drop_mode == "between":
-            sibs    = list(self._tree.get_children(insert_parent))
-            src_idx = sibs.index(src)
-            if src_idx < insert_idx:
-                insert_idx -= 1
-
         if drop_mode == "into":
-            self._tree.move(src, insert_parent, "end")
+            self._push_undo()
+            items_to_move = [i for i in drag_iids if i != insert_parent]
+            for item in items_to_move:
+                self._tree.move(item, insert_parent, "end")
             self._tree.item(insert_parent, open=True)
+            if items_to_move:
+                self._tree.selection_set(*items_to_move)
+                self._tree.see(items_to_move[0])
         else:
-            self._tree.move(src, insert_parent, insert_idx)
+            do_move(insert_parent, insert_idx)
 
-        self._tree.selection_set(src)
-        self._tree.see(src)
+    # ── Bulk Rename ────────────────────────────────────────
 
-    # ── Keyboard shortcut targets ─────────────
+    def _open_bulk_rename(self):
+        if not self._parsed_root:
+            messagebox.showwarning("No file", "Load a bookmarks file first.")
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Bulk Rename")
+        dlg.geometry("680x520")
+        dlg.minsize(500, 400)
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+        c = self._colors
+
+        ctrl = tk.Frame(dlg, bg=c["bg"])
+        ctrl.pack(fill=tk.X, padx=12, pady=(12, 6))
+
+        tk.Label(ctrl, text="Field:", bg=c["bg"], fg=c["text"],
+                 font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", padx=(0,6))
+        field_var = tk.StringVar(value="name")
+        ff = tk.Frame(ctrl, bg=c["bg"])
+        ff.grid(row=0, column=1, sticky="w")
+        tk.Radiobutton(ff, text="Name", variable=field_var, value="name",
+                       bg=c["bg"], fg=c["text"], selectcolor=c["sel"],
+                       font=("Segoe UI", 9), activebackground=c["bg"]).pack(side=tk.LEFT)
+        tk.Radiobutton(ff, text="URL", variable=field_var, value="href",
+                       bg=c["bg"], fg=c["text"], selectcolor=c["sel"],
+                       font=("Segoe UI", 9), activebackground=c["bg"]).pack(
+                       side=tk.LEFT, padx=(10, 0))
+
+        tk.Label(ctrl, text="Find:", bg=c["bg"], fg=c["text"],
+                 font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", pady=(6,0))
+        find_var = tk.StringVar()
+        tk.Entry(ctrl, textvariable=find_var, bg=c["panel"], fg=c["text"],
+                 insertbackground=c["text"], font=("Segoe UI", 9), relief="flat",
+                 highlightthickness=1, highlightbackground=c["sel"],
+                 highlightcolor=c["accent"]).grid(row=1, column=1, sticky="ew", pady=(6,0))
+
+        tk.Label(ctrl, text="Replace:", bg=c["bg"], fg=c["text"],
+                 font=("Segoe UI", 9)).grid(row=2, column=0, sticky="w", pady=(4,0))
+        replace_var = tk.StringVar()
+        tk.Entry(ctrl, textvariable=replace_var, bg=c["panel"], fg=c["text"],
+                 insertbackground=c["text"], font=("Segoe UI", 9), relief="flat",
+                 highlightthickness=1, highlightbackground=c["sel"],
+                 highlightcolor=c["accent"]).grid(row=2, column=1, sticky="ew", pady=(4,0))
+
+        case_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(ctrl, text="Case-sensitive", variable=case_var,
+                       bg=c["bg"], fg=c["text"], selectcolor=c["sel"],
+                       font=("Segoe UI", 9), activebackground=c["bg"]).grid(
+                       row=3, column=1, sticky="w", pady=(4,0))
+        ctrl.columnconfigure(1, weight=1)
+
+        # Preview label row with Select All / None toggles
+        plbl_row = tk.Frame(dlg, bg=c["bg"])
+        plbl_row.pack(fill=tk.X, padx=12, pady=(4, 0))
+        tk.Label(plbl_row, text="Preview  (tick rows to include in rename):",
+                 bg=c["bg"], fg=c["subtext"], font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        tk.Button(plbl_row, text="All", bg=c["bg"], fg=c["accent"],
+                  font=("Segoe UI", 9), relief="flat", bd=0, cursor="hand2",
+                  command=lambda: _toggle_all(True)).pack(side=tk.RIGHT)
+        tk.Label(plbl_row, text="/", bg=c["bg"], fg=c["subtext"],
+                 font=("Segoe UI", 9)).pack(side=tk.RIGHT)
+        tk.Button(plbl_row, text="None", bg=c["bg"], fg=c["accent"],
+                  font=("Segoe UI", 9), relief="flat", bd=0, cursor="hand2",
+                  command=lambda: _toggle_all(False)).pack(side=tk.RIGHT)
+        tk.Label(plbl_row, text="Select: ", bg=c["bg"], fg=c["subtext"],
+                 font=("Segoe UI", 9)).pack(side=tk.RIGHT)
+
+        pf = tk.Frame(dlg, bg=c["panel"])
+        pf.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 4))
+        pt = ttk.Treeview(pf, columns=("apply", "field", "before", "after"),
+                          show="headings", selectmode="none")
+        pt.heading("apply",  text="☑",      anchor="center",
+                   command=lambda: _toggle_all(not all(i["var"].get() for i in _preview_vars.values())))
+        pt.heading("field",  text="Field",  anchor="center")
+        pt.heading("before", text="Before")
+        pt.heading("after",  text="After")
+        pt.column("apply",  width=34,  stretch=False, anchor="center")
+        pt.column("field",  width=60,  stretch=False, anchor="center")
+        pt.column("before", width=220, stretch=True)
+        pt.column("after",  width=220, stretch=True)
+        pt.tag_configure("checked",   foreground=c["accent"])
+        pt.tag_configure("unchecked", foreground=c["subtext"])
+        ptsb = ttk.Scrollbar(pf, orient=tk.VERTICAL, command=pt.yview)
+        pt.configure(yscrollcommand=ptsb.set)
+        pt.grid(row=0, column=0, sticky="nsew")
+        ptsb.grid(row=0, column=1, sticky="ns")
+        pf.rowconfigure(0, weight=1)
+        pf.columnconfigure(0, weight=1)
+
+        # Map preview-row iid → (tree_iid, BooleanVar)
+        _preview_vars = {}   # pt_iid → {"tree_iid": ..., "var": BooleanVar}
+
+        def _sync_header():
+            if not _preview_vars:
+                pt.heading("apply", text="☑")
+                return
+            states = [i["var"].get() for i in _preview_vars.values()]
+            if all(states):
+                pt.heading("apply", text="☑")
+            elif any(states):
+                pt.heading("apply", text="☒")
+            else:
+                pt.heading("apply", text="☐")
+
+        def _set_row_display(pt_iid):
+            info = _preview_vars.get(pt_iid)
+            if not info:
+                return
+            checked = info["var"].get()
+            vals    = pt.item(pt_iid, "values")
+            pt.item(pt_iid,
+                    values=("☑" if checked else "☐", vals[1], vals[2], vals[3]),
+                    tags=("checked" if checked else "unchecked",))
+            _sync_header()
+            _refresh_match_lbl()
+
+        def _on_pt_click(event):
+            col = pt.identify_column(event.x)
+            iid = pt.identify_row(event.y)
+            if iid and col == "#1":
+                info = _preview_vars.get(iid)
+                if info:
+                    info["var"].set(not info["var"].get())
+                    _set_row_display(iid)
+
+        pt.bind("<ButtonPress-1>", _on_pt_click)
+
+        def _toggle_all(state):
+            for pt_iid, info in _preview_vars.items():
+                info["var"].set(state)
+                vals = pt.item(pt_iid, "values")
+                pt.item(pt_iid,
+                        values=("☑" if state else "☐", vals[1], vals[2], vals[3]),
+                        tags=("checked" if state else "unchecked",))
+            _sync_header()
+            _refresh_match_lbl()
+
+        match_lbl = tk.Label(dlg, text="", bg=c["bg"], fg=c["subtext"],
+                             font=("Segoe UI", 9))
+        match_lbl.pack(anchor="w", padx=12)
+
+        def _refresh_match_lbl():
+            checked = sum(1 for i in _preview_vars.values() if i["var"].get())
+            total   = len(_preview_vars)
+            if total == 0:
+                match_lbl.config(text="")
+            else:
+                match_lbl.config(
+                    text=f"{total} match{'es' if total != 1 else ''}  —  "
+                         f"{checked} selected for rename.")
+
+        def _all_iids():
+            result = []
+            def walk(iid):
+                result.append(iid)
+                for ch in self._tree.get_children(iid):
+                    walk(ch)
+            for iid in self._tree.get_children(""):
+                walk(iid)
+            return result
+
+        def _do_preview(*_):
+            import re as _re
+            find    = find_var.get()
+            replace = replace_var.get()
+            field   = field_var.get()
+            case    = case_var.get()
+            pt.delete(*pt.get_children())
+            _preview_vars.clear()
+            if not find:
+                match_lbl.config(text="")
+                return
+            for tree_iid in _all_iids():
+                node = self._node_map.get(tree_iid)
+                if not node:
+                    continue
+                orig = node.get(field) or ""
+                nv   = orig.replace(find, replace) if case else \
+                       _re.sub(_re.escape(find), replace, orig, flags=_re.IGNORECASE)
+                if nv != orig:
+                    var    = tk.BooleanVar(value=True)
+                    pt_iid = pt.insert("", "end",
+                                       values=("☑", field, orig[:100], nv[:100]),
+                                       tags=("checked",))
+                    _preview_vars[pt_iid] = {"tree_iid": tree_iid, "var": var}
+            _refresh_match_lbl()
+            _sync_header()
+
+        find_var.trace_add("write", _do_preview)
+        replace_var.trace_add("write", _do_preview)
+        field_var.trace_add("write", _do_preview)
+        case_var.trace_add("write", _do_preview)
+
+        def _apply():
+            import re as _re
+            find    = find_var.get()
+            replace = replace_var.get()
+            field   = field_var.get()
+            case    = case_var.get()
+            if not find:
+                messagebox.showwarning("Empty search",
+                                       "Enter a Find value.", parent=dlg)
+                return
+            selected = {info["tree_iid"] for info in _preview_vars.values()
+                        if info["var"].get()}
+            if not selected:
+                messagebox.showwarning("Nothing selected",
+                                       "Tick at least one row to rename.", parent=dlg)
+                return
+            self._push_undo()
+            count = 0
+            for tree_iid in selected:
+                node = self._node_map.get(tree_iid)
+                if not node:
+                    continue
+                orig = node.get(field) or ""
+                nv   = orig.replace(find, replace) if case else \
+                       _re.sub(_re.escape(find), replace, orig, flags=_re.IGNORECASE)
+                if nv != orig:
+                    node[field] = nv
+                    if field == "name":
+                        if node["type"] == "folder":
+                            cnt = self._folder_bm_counts.get(tree_iid, count_bookmarks(node.get("children", [])))
+                            self._tree.item(tree_iid, text=f"  📁  {nv} ({cnt})")
+                        else:
+                            self._tree.item(tree_iid, text=f"  🔖  {nv}")
+                    count += 1
+            dlg.destroy()
+            self._status_var.set(
+                f"Bulk rename: {count} item{'s' if count != 1 else ''} updated.")
+
+        br = tk.Frame(dlg, bg=c["bg"])
+        br.pack(fill=tk.X, padx=12, pady=(0, 12))
+        tk.Button(br, text="Apply", bg=c["accent"], fg="#ffffff",
+                  font=("Segoe UI", 9, "bold"), relief="flat", padx=12, pady=4,
+                  cursor="hand2", command=_apply).pack(side=tk.RIGHT, padx=(6,0))
+        tk.Button(br, text="Cancel", bg=c["sel"], fg=c["text"],
+                  font=("Segoe UI", 9), relief="flat", padx=12, pady=4,
+                  cursor="hand2", command=dlg.destroy).pack(side=tk.RIGHT)
+
+        dlg.bind("<Return>", lambda e: _apply())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    # ── Filtering ─────────────────────────────
+
+    def _node_passes_filter(self, node):
+        """Return True if node should be visible given active filters."""
+        f = self._active_filters
+        ntype = node.get("type", "bookmark")
+
+        # ── Type filter ───────────────────────────────────────────────────
+        if f["type"]:
+            if ntype == "folder":
+                # Keep folder only if at least one descendant passes all filters
+                return any(self._node_passes_filter(c) for c in node.get("children", []))
+            elif ntype != f["type"]:
+                return False
+
+        # ── Folder-scope filter ───────────────────────────────────────────
+        if f["folders"]:
+            if ntype == "folder":
+                # Keep folder structure if any child passes
+                return any(self._node_passes_filter(c) for c in node.get("children", []))
+            elif ntype == "bookmark":
+                # Bookmark must be a descendant of one of the selected folders
+                if not self._folder_nodes_selected(node, f["folders"]):
+                    return False
+
+        # ── Date filter (bookmarks only) ──────────────────────────────────
+        if ntype == "bookmark":
+            add_date = node.get("add_date")
+            ts = int(add_date) if add_date and str(add_date).isdigit() else None
+            if f["date_after"] is not None and (ts is None or ts < f["date_after"]):
+                return False
+            if f["date_before"] is not None and (ts is None or ts > f["date_before"]):
+                return False
+
+        return True
+
+    def _folder_nodes_selected(self, node, selected_folder_nodes):
+        """Return True if node is a descendant of any node in selected_folder_nodes."""
+        return any(
+            self._is_descendant(node, fn) for fn in selected_folder_nodes
+        )
+
+    def _is_descendant(self, node, ancestor):
+        """Return True if node is anywhere inside ancestor's children tree."""
+        for child in ancestor.get("children", []):
+            if child is node:
+                return True
+            if child.get("type") == "folder" and self._is_descendant(node, child):
+                return True
+        return False
+
+    def _has_active_filters(self):
+        f = self._active_filters
+        return any([f["type"], f["date_after"] is not None,
+                    f["date_before"] is not None, f["folders"]])
+
+    def _refresh_filter_bar(self):
+        c = self._colors
+        for w in self._filter_bar_inner.winfo_children():
+            w.destroy()
+
+        if not self._has_active_filters():
+            self._filter_bar.pack_forget()
+            self._filter_btn.config(style="Ghost.TButton")
+            return
+
+        # Show the bar
+        self._filter_bar.pack(fill=tk.X, pady=(0, 4), before=self._search_bar_frame)
+        self._filter_btn.config(style="Accent.TButton")
+
+        f = self._active_filters
+        chips = []
+        if f["type"]:
+            chips.append((f"Type: {f['type']}s only", "type"))
+        if f["date_after"] is not None:
+            from datetime import datetime as _dt
+            chips.append((f"After: {_dt.fromtimestamp(f['date_after']).strftime('%Y-%m-%d')}", "date_after"))
+        if f["date_before"] is not None:
+            from datetime import datetime as _dt
+            chips.append((f"Before: {_dt.fromtimestamp(f['date_before']).strftime('%Y-%m-%d')}", "date_before"))
+        if f["folders"]:
+            names = ", ".join((fn.get("name") or "(unnamed)")[:20] for fn in f["folders"][:3])
+            if len(f["folders"]) > 3:
+                names += f" +{len(f['folders'])-3}"
+            chips.append((f"Folders: {names}", "folders"))
+
+        tk.Label(self._filter_bar_inner, text="Filters:", bg=c["bg"],
+                 fg=c["subtext"], font=("Segoe UI", 8), padx=4).pack(side=tk.LEFT)
+        for label, key in chips:
+            chip = tk.Frame(self._filter_bar_inner, bg=c["sel"], padx=2, pady=1)
+            chip.pack(side=tk.LEFT, padx=(0, 4))
+            tk.Label(chip, text=label, bg=c["sel"], fg=c["text"],
+                     font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(4, 2))
+            def _make_clear(k):
+                def _clear():
+                    if k in ("date_after", "date_before"):
+                        self._active_filters[k] = None
+                    else:
+                        self._active_filters[k] = None
+                    self._refresh_filter_bar()
+                    self._repopulate()
+                return _clear
+            tk.Button(chip, text="✕", bg=c["sel"], fg=c["subtext"],
+                      font=("Segoe UI", 7), relief="flat", bd=0,
+                      cursor="hand2", command=_make_clear(key)).pack(side=tk.LEFT)
+
+    def _clear_all_filters(self):
+        self._active_filters = {"type": None, "date_after": None,
+                                "date_before": None, "folders": None}
+        self._refresh_filter_bar()
+        self._repopulate()
+
+    def _repopulate(self):
+        if self._parsed_root:
+            self._populate_tree(self._parsed_root,
+                                search_term=self._search_var.get().strip().lower())
+
+    def _open_filter_dialog(self):
+        if not self._parsed_root:
+            messagebox.showwarning("No file", "Load a bookmarks file first.")
+            return
+
+        c = self._colors
+        f = self._active_filters
+        dlg = tk.Toplevel(self)
+        dlg.title("Filter Bookmarks")
+        dlg.geometry("600x520")
+        dlg.minsize(480, 400)
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+
+        # ── Tab bar ────────────────────────────────────────────────────────
+        tab_frame = tk.Frame(dlg, bg=c["bg"])
+        tab_frame.pack(fill=tk.X, padx=12, pady=(12, 0))
+        content_frame = tk.Frame(dlg, bg=c["bg"])
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(6, 0))
+
+        _tab_panels = {}
+        _active_tab = tk.StringVar(value="type")
+
+        def _switch_tab(name):
+            _active_tab.set(name)
+            for n, panel in _tab_panels.items():
+                panel.pack_forget()
+            _tab_panels[name].pack(fill=tk.BOTH, expand=True)
+            for n, btn in _tab_btns.items():
+                btn.config(bg=c["accent"] if n == name else c["sel"],
+                           fg="#ffffff" if n == name else c["text"])
+
+        _tab_btns = {}
+        for tab_name, tab_label in [("type", "Type"), ("date", "Date"), ("folders", "Folders")]:
+            btn = tk.Button(tab_frame, text=tab_label,
+                            bg=c["sel"], fg=c["text"],
+                            font=("Segoe UI", 9), relief="flat", bd=0,
+                            padx=14, pady=5, cursor="hand2",
+                            command=lambda n=tab_name: _switch_tab(n))
+            btn.pack(side=tk.LEFT, padx=(0, 4))
+            _tab_btns[tab_name] = btn
+
+        # ── Type panel ────────────────────────────────────────────────────
+        type_panel = tk.Frame(content_frame, bg=c["bg"])
+        _tab_panels["type"] = type_panel
+
+        tk.Label(type_panel, text="Show only:", bg=c["bg"], fg=c["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(12, 6))
+        type_var = tk.StringVar(value=f["type"] or "all")
+        for val, lbl, desc in [
+            ("all",      "All items",       "Show both folders and bookmarks (default)"),
+            ("bookmark", "Bookmarks only",  "Hide all folders, show only bookmark entries"),
+            ("folder",   "Folders only",    "Show only folder nodes"),
+        ]:
+            row = tk.Frame(type_panel, bg=c["bg"])
+            row.pack(fill=tk.X, pady=2)
+            tk.Radiobutton(row, text=lbl, variable=type_var, value=val,
+                           bg=c["bg"], fg=c["text"], selectcolor=c["sel"],
+                           font=("Segoe UI", 10), activebackground=c["bg"]).pack(side=tk.LEFT)
+            tk.Label(row, text=f"  — {desc}", bg=c["bg"], fg=c["subtext"],
+                     font=("Segoe UI", 9)).pack(side=tk.LEFT)
+
+        # ── Date panel ────────────────────────────────────────────────────
+        date_panel = tk.Frame(content_frame, bg=c["bg"])
+        _tab_panels["date"] = date_panel
+
+        tk.Label(date_panel, text="Filter by ADD_DATE (Unix timestamp or YYYY-MM-DD):",
+                 bg=c["bg"], fg=c["text"], font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(12, 6))
+
+        def _ts_to_str(ts):
+            if ts is None:
+                return ""
+            try:
+                from datetime import datetime as _dt
+                return _dt.fromtimestamp(ts).strftime("%Y-%m-%d")
+            except Exception:
+                return str(ts)
+
+        def _str_to_ts(s):
+            s = s.strip()
+            if not s:
+                return None
+            if s.isdigit():
+                return int(s)
+            try:
+                from datetime import datetime as _dt
+                return int(_dt.strptime(s, "%Y-%m-%d").timestamp())
+            except Exception:
+                return None
+
+        after_var  = tk.StringVar(value=_ts_to_str(f["date_after"]))
+        before_var = tk.StringVar(value=_ts_to_str(f["date_before"]))
+
+        for label, var in [("Added after:",  after_var),
+                           ("Added before:", before_var)]:
+            row = tk.Frame(date_panel, bg=c["bg"])
+            row.pack(fill=tk.X, pady=(0, 8))
+            tk.Label(row, text=label, bg=c["bg"], fg=c["text"],
+                     font=("Segoe UI", 9), width=14, anchor="w").pack(side=tk.LEFT)
+            tk.Entry(row, textvariable=var, bg=c["panel"], fg=c["text"],
+                     insertbackground=c["text"], font=("Segoe UI", 9), relief="flat",
+                     highlightthickness=1, highlightbackground=c["sel"],
+                     highlightcolor=c["accent"], width=20).pack(side=tk.LEFT, ipady=4)
+            tk.Label(row, text="  e.g. 2023-06-15", bg=c["bg"], fg=c["subtext"],
+                     font=("Segoe UI", 8)).pack(side=tk.LEFT)
+
+        date_err = tk.Label(date_panel, text="", bg=c["bg"], fg=c["danger"],
+                            font=("Segoe UI", 8))
+        date_err.pack(anchor="w")
+
+        # ── Folders panel ─────────────────────────────────────────────────
+        folders_panel = tk.Frame(content_frame, bg=c["bg"])
+        _tab_panels["folders"] = folders_panel
+
+        tk.Label(folders_panel,
+                 text="Show only bookmarks inside selected folders:",
+                 bg=c["bg"], fg=c["text"], font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(12, 4))
+
+        ffilter_var = tk.StringVar()
+        fe = tk.Entry(folders_panel, textvariable=ffilter_var, bg=c["panel"], fg=c["text"],
+                      insertbackground=c["text"], font=("Segoe UI", 9), relief="flat",
+                      highlightthickness=1, highlightbackground=c["sel"],
+                      highlightcolor=c["accent"])
+        fe.pack(fill=tk.X, pady=(0, 4), ipady=4)
+        tk.Label(folders_panel, text="⌕  Type to filter list", bg=c["bg"], fg=c["subtext"],
+                 font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 4))
+
+        # Build full folder list: [(name_path, node_ref)]
+        all_folders = []
+        def _collect_folders(nodes, path=""):
+            for node in nodes:
+                if node["type"] == "folder":
+                    name = node.get("name") or "(unnamed)"
+                    all_folders.append((path + name, node))
+                    _collect_folders(node.get("children", []), path + name + " › ")
+        _collect_folders(self._parsed_root.get("children", []))
+
+        # Currently selected folder nodes
+        _sel_nodes = set(id(n) for n in (f["folders"] or []))
+
+        flf = tk.Frame(folders_panel, bg=c["panel"])
+        flf.pack(fill=tk.BOTH, expand=True)
+        flb = tk.Listbox(flf, bg=c["panel"], fg=c["text"],
+                         font=("Segoe UI", 9), relief="flat",
+                         selectbackground=c["sel"], selectforeground=c["text"],
+                         activestyle="none", highlightthickness=0,
+                         selectmode=tk.MULTIPLE)
+        flsb = ttk.Scrollbar(flf, orient=tk.VERTICAL, command=flb.yview)
+        flb.configure(yscrollcommand=flsb.set)
+        flb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        flsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        _displayed = []   # parallel list of node refs for current listbox
+
+        def _refresh_folder_list(*_):
+            term = ffilter_var.get().strip().lower()
+            flb.delete(0, tk.END)
+            _displayed.clear()
+            for path, node in all_folders:
+                if not term or term in path.lower():
+                    cnt = count_bookmarks(node.get("children", []))
+                    flb.insert(tk.END, f"  📁  {path}  ({cnt})")
+                    _displayed.append(node)
+            # Restore selections
+            for i, node in enumerate(_displayed):
+                if id(node) in _sel_nodes:
+                    flb.selection_set(i)
+
+        ffilter_var.trace_add("write", _refresh_folder_list)
+        _refresh_folder_list()
+
+        sel_lbl = tk.Label(folders_panel, text="", bg=c["bg"], fg=c["subtext"],
+                           font=("Segoe UI", 8))
+        sel_lbl.pack(anchor="w", pady=(2, 0))
+
+        def _on_folder_select(_event=None):
+            n = len(flb.curselection())
+            sel_lbl.config(text=f"{n} folder{'s' if n != 1 else ''} selected")
+        flb.bind("<<ListboxSelect>>", _on_folder_select)
+        _on_folder_select()
+
+        # ── Bottom buttons ────────────────────────────────────────────────
+        bf = tk.Frame(dlg, bg=c["bg"])
+        bf.pack(fill=tk.X, padx=12, pady=(6, 10))
+
+        def _apply_filters():
+            nonlocal f
+            # Type
+            tv = type_var.get()
+            self._active_filters["type"] = None if tv == "all" else tv
+
+            # Date
+            da = _str_to_ts(after_var.get())
+            db = _str_to_ts(before_var.get())
+            if after_var.get().strip() and da is None:
+                date_err.config(text="⚠  Invalid 'After' date — use YYYY-MM-DD or Unix timestamp")
+                _switch_tab("date")
+                return
+            if before_var.get().strip() and db is None:
+                date_err.config(text="⚠  Invalid 'Before' date — use YYYY-MM-DD or Unix timestamp")
+                _switch_tab("date")
+                return
+            self._active_filters["date_after"]  = da
+            self._active_filters["date_before"] = db
+
+            # Folders
+            sel_indices = flb.curselection()
+            if sel_indices:
+                self._active_filters["folders"] = [_displayed[i] for i in sel_indices]
+            else:
+                self._active_filters["folders"] = None
+
+            dlg.destroy()
+            self._refresh_filter_bar()
+            self._repopulate()
+
+        tk.Button(bf, text="Apply Filters", bg=c["accent"], fg="#ffffff",
+                  font=("Segoe UI", 9, "bold"), relief="flat", padx=12, pady=4,
+                  cursor="hand2", command=_apply_filters).pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(bf, text="Clear All", bg=c["sel"], fg=c["text"],
+                  font=("Segoe UI", 9), relief="flat", padx=12, pady=4,
+                  cursor="hand2", command=self._clear_all_filters).pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(bf, text="Cancel", bg=c["sel"], fg=c["text"],
+                  font=("Segoe UI", 9), relief="flat", padx=12, pady=4,
+                  cursor="hand2", command=dlg.destroy).pack(side=tk.RIGHT)
+
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        _switch_tab("type")
+
+    # ── Breadcrumb ────────────────────────────
+
+    def _update_breadcrumb(self):
+        c = self._colors
+        # Clear existing segments
+        for w in self._bc_inner.winfo_children():
+            w.destroy()
+
+        sel = self._tree.selection()
+        if not sel or not self._parsed_root:
+            tk.Label(self._bc_inner, text="—", bg=c["sel"], fg=c["subtext"],
+                     font=("Segoe UI", 8), padx=6, pady=2).pack(side=tk.LEFT)
+            return
+
+        iid = sel[-1]
+        # Build list of (name, iid) from root down to selected item
+        pairs = []   # [(name, iid)]
+        cur = iid
+        while cur:
+            node = self._node_map.get(cur)
+            if node:
+                pairs.append((node.get("name") or "(unnamed)", cur))
+            cur = self._tree.parent(cur)
+        pairs.reverse()
+
+        # "Bookmarks" root label (not clickable — no iid)
+        tk.Label(self._bc_inner, text="Bookmarks", bg=c["sel"], fg=c["subtext"],
+                 font=("Segoe UI", 8), padx=6, pady=2).pack(side=tk.LEFT)
+
+        for i, (name, seg_iid) in enumerate(pairs):
+            # Separator
+            tk.Label(self._bc_inner, text="›", bg=c["sel"], fg=c["subtext"],
+                     font=("Segoe UI", 8), padx=2, pady=2).pack(side=tk.LEFT)
+
+            is_last = (i == len(pairs) - 1)
+            node = self._node_map.get(seg_iid, {})
+            if node.get("type") == "folder":
+                btn = tk.Label(self._bc_inner, text=name, bg=c["sel"],
+                               fg=c["subtext"], font=("Segoe UI", 8, "underline"),
+                               padx=2, pady=2, cursor="hand2")
+                btn.pack(side=tk.LEFT)
+                def _make_jump(target):
+                    def _jump(_event=None):
+                        parent = self._tree.parent(target)
+                        while parent:
+                            self._tree.item(parent, open=True)
+                            parent = self._tree.parent(parent)
+                        self._tree.item(target, open=True)
+                        self._tree.selection_set(target)
+                        self._tree.focus(target)
+                        self._tree.see(target)
+                        self._update_breadcrumb()
+                    return _jump
+                btn.bind("<Button-1>", _make_jump(seg_iid))
+                btn.bind("<Enter>", lambda e, b=btn: b.config(fg=c["text"]))
+                btn.bind("<Leave>", lambda e, b=btn: b.config(fg=c["subtext"]))
+            else:
+                tk.Label(self._bc_inner, text=name, bg=c["sel"],
+                         fg=c["text"] if is_last else c["subtext"],
+                         font=("Segoe UI", 8, "bold" if is_last else "normal"),
+                         padx=2, pady=2).pack(side=tk.LEFT)
+
+        # Auto-scroll to the right end so the deepest item is always visible
+        self._bc_inner.update_idletasks()
+        self._bc_canvas.configure(scrollregion=self._bc_canvas.bbox("all"))
+        self._bc_canvas.xview_moveto(1.0)
+
+    # ── Jump to Folder ────────────────────────
+
+    def _open_jump_to_folder(self):
+        if not self._parsed_root:
+            messagebox.showwarning("No file", "Load a bookmarks file first.")
+            return
+
+        folders = []   # [(display_path, iid)]
+        def walk(iid, path):
+            node = self._node_map.get(iid)
+            if not node:
+                return
+            if node["type"] == "folder":
+                name = node.get("name") or "(unnamed)"
+                folders.append((path + name, iid))
+                for ch in self._tree.get_children(iid):
+                    walk(ch, path + name + "  ›  ")
+        for iid in self._tree.get_children(""):
+            walk(iid, "")
+
+        if not folders:
+            messagebox.showinfo("No Folders", "No folders found in the tree.")
+            return
+
+        c = self._colors
+        dlg = tk.Toplevel(self)
+        dlg.title("Jump to Folder")
+        dlg.geometry("540x380")
+        dlg.minsize(400, 280)
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+
+        tk.Label(dlg, text="Type to filter folders:", bg=c["bg"], fg=c["subtext"],
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=12, pady=(12, 2))
+
+        filter_var = tk.StringVar()
+        entry = tk.Entry(dlg, textvariable=filter_var, bg=c["panel"], fg=c["text"],
+                         insertbackground=c["text"], font=("Segoe UI", 10), relief="flat",
+                         highlightthickness=1, highlightbackground=c["sel"],
+                         highlightcolor=c["accent"])
+        entry.pack(fill=tk.X, padx=12, ipady=6)
+        entry.focus_set()
+
+        lf = tk.Frame(dlg, bg=c["panel"])
+        lf.pack(fill=tk.BOTH, expand=True, padx=12, pady=(6, 4))
+        lb = tk.Listbox(lf, bg=c["panel"], fg=c["text"], font=("Segoe UI", 9),
+                        relief="flat", selectbackground=c["sel"], selectforeground=c["text"],
+                        activestyle="none", highlightthickness=0, borderwidth=0)
+        lsb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=lb.yview)
+        lb.configure(yscrollcommand=lsb.set)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        _filtered = []
+
+        def _refresh_list(*_):
+            term = filter_var.get().strip().lower()
+            lb.delete(0, tk.END)
+            _filtered.clear()
+            for path, iid in folders:
+                if not term or term in path.lower():
+                    cnt = self._folder_bm_counts.get(iid, "")
+                    suffix = f" ({cnt})" if cnt != "" else ""
+                    lb.insert(tk.END, f"  📁  {path}{suffix}")
+                    _filtered.append(iid)
+            if _filtered:
+                lb.selection_set(0)
+
+        filter_var.trace_add("write", _refresh_list)
+        _refresh_list()
+
+        def _jump(*_):
+            sel_idx = lb.curselection()
+            if not sel_idx or not _filtered:
+                return
+            target_iid = _filtered[sel_idx[0]]
+            dlg.destroy()
+            parent = self._tree.parent(target_iid)
+            while parent:
+                self._tree.item(parent, open=True)
+                parent = self._tree.parent(parent)
+            self._tree.selection_set(target_iid)
+            self._tree.focus(target_iid)
+            self._tree.see(target_iid)
+            self._update_breadcrumb()
+
+        def _on_key(event):
+            if event.keysym == "Down":
+                cur = lb.curselection()
+                nxt = (cur[0] + 1) if cur and cur[0] < lb.size() - 1 else 0
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(nxt)
+                lb.see(nxt)
+                return "break"
+            if event.keysym == "Up":
+                cur = lb.curselection()
+                prv = (cur[0] - 1) if cur and cur[0] > 0 else lb.size() - 1
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(prv)
+                lb.see(prv)
+                return "break"
+            if event.keysym == "Return":
+                _jump()
+                return "break"
+            if event.keysym == "Escape":
+                dlg.destroy()
+                return "break"
+
+        entry.bind("<Key>", _on_key)
+        lb.bind("<Double-Button-1>", _jump)
+        lb.bind("<Return>", _jump)
+
+        bf = tk.Frame(dlg, bg=c["bg"])
+        bf.pack(fill=tk.X, padx=12, pady=(0, 10))
+        tk.Button(bf, text="Jump", bg=c["accent"], fg="#ffffff",
+                  font=("Segoe UI", 9, "bold"), relief="flat", padx=12, pady=4,
+                  cursor="hand2", command=_jump).pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(bf, text="Cancel", bg=c["sel"], fg=c["text"],
+                  font=("Segoe UI", 9), relief="flat", padx=12, pady=4,
+                  cursor="hand2", command=dlg.destroy).pack(side=tk.RIGHT)
+
+        # ── Keyboard shortcut targets ─────────────
+
+    def _shortcut_jump_to_folder(self):
+        self._open_jump_to_folder()
 
     def _shortcut_open(self):
         self._open_file()
@@ -860,6 +1927,12 @@ class NormalModeFrame(ttk.Frame):
 
     def _shortcut_focus_filter(self):
         self._search_entry.focus_set()
+
+    def _shortcut_undo(self):
+        self._undo()
+
+    def _shortcut_redo(self):
+        self._redo()
 
     def apply_colors(self, c):
         """Update all manually-colored widgets when theme changes."""
@@ -871,14 +1944,102 @@ class NormalModeFrame(ttk.Frame):
                                   highlightcolor=c["accent"])
         self._search_clear_btn.config(bg=c["panel"], fg=c["subtext"])
         self._info_text.config(bg=c["panel"], fg=c["text"])
+        self._bc_frame.config(bg=c["sel"])
+        self._bc_canvas.config(bg=c["sel"])
+        self._bc_inner.config(bg=c["sel"])
+        self._update_breadcrumb()
         # Lock button — keep its state-appropriate color
         if self._drag_locked:
             self._lock_btn.config(bg=c["sel"], fg=c["text"])
         else:
             self._lock_btn.config(bg=c["accent"], fg="#ffffff")
 
+    def _visible_iids(self):
+        """Return all currently visible (not inside collapsed folder) iids in tree order."""
+        result = []
+        def walk(iid):
+            result.append(iid)
+            if self._tree.item(iid, "open"):
+                for ch in self._tree.get_children(iid):
+                    walk(ch)
+        for iid in self._tree.get_children(""):
+            walk(iid)
+        return result
+
+    def _reset_sel_anchor(self):
+        sel = self._tree.selection()
+        self._sel_anchor = self._tree.focus() or (sel[0] if sel else None)
+
+    def _on_plain_up(self, event):
+        # Plain Up — let tkinter handle movement, just reset anchor after
+        self.after_idle(self._reset_sel_anchor)
+
+    def _on_plain_down(self, event):
+        # Plain Down — let tkinter handle movement, just reset anchor after
+        self.after_idle(self._reset_sel_anchor)
+
+    def _on_shift_up(self, event):
+        sel = list(self._tree.selection())
+        if not sel:
+            return "break"
+        focus = self._tree.focus() or sel[0]
+        # Set anchor on first shift keypress
+        if not getattr(self, "_sel_anchor", None):
+            self._reset_sel_anchor()
+        all_iids = self._visible_iids()
+        if focus not in all_iids:
+            return "break"
+        fi = all_iids.index(focus)
+        if fi == 0:
+            return "break"
+        new_focus = all_iids[fi - 1]
+        ai = all_iids.index(self._sel_anchor) if self._sel_anchor in all_iids else fi
+        lo, hi = min(ai, fi - 1), max(ai, fi - 1)
+        self._tree.selection_set(all_iids[lo:hi+1])
+        self._tree.focus(new_focus)
+        self._tree.see(new_focus)
+        return "break"
+
+    def _on_shift_down(self, event):
+        sel = list(self._tree.selection())
+        if not sel:
+            return "break"
+        focus = self._tree.focus() or sel[0]
+        # Set anchor on first shift keypress
+        if not getattr(self, "_sel_anchor", None):
+            self._reset_sel_anchor()
+        all_iids = self._visible_iids()
+        if focus not in all_iids:
+            return "break"
+        fi = all_iids.index(focus)
+        if fi >= len(all_iids) - 1:
+            return "break"
+        new_focus = all_iids[fi + 1]
+        ai = all_iids.index(self._sel_anchor) if self._sel_anchor in all_iids else fi
+        lo, hi = min(ai, fi + 1), max(ai, fi + 1)
+        self._tree.selection_set(all_iids[lo:hi+1])
+        self._tree.focus(new_focus)
+        self._tree.see(new_focus)
+        return "break"
+
+    def _on_space_toggle(self, event):
+        # Only toggle on plain Space — let Shift+Space and Ctrl+Space pass through
+        if event.state & 0x1 or event.state & 0x4:   # Shift or Ctrl held
+            return
+        for iid in self._tree.selection():
+            self._toggle_check(iid)
+        return "break"
+
+    def _on_ctrl_a(self, event):
+        """Ctrl+A — select all visible tree items."""
+        all_iids = list(self._node_map.keys())
+        if all_iids:
+            self._tree.selection_set(all_iids)
+        return "break"
+
     def _heading_toggle_all(self):
         """Click on ✓ column header → toggle all items."""
+        self._push_undo()
         self._all_checked = not self._all_checked
         for iid in list(self._node_map.keys()):
             self._set_check(iid, self._all_checked, propagate=False)
@@ -890,6 +2051,7 @@ class NormalModeFrame(ttk.Frame):
             return
         var = self._check_vars[iid]
         new_state = state if state is not None else not var.get()
+        self._push_undo()
         self._set_check(iid, new_state, propagate=True)
         # Refresh parent folder indicators up the tree
         parent = self._tree.parent(iid)
@@ -959,22 +2121,24 @@ class NormalModeFrame(ttk.Frame):
         for iid in self._tree.get_children(""):
             refresh_subtree(iid)
 
-    def _select_all(self):
+    def _set_all_checked(self, state: bool):
+        """Set every item in the tree to checked (True) or unchecked (False)."""
+        self._push_undo()
         for iid in self._tree.get_children(""):
-            self._set_check(iid, True, propagate=True)
-        self._all_checked = True
+            self._set_check(iid, state, propagate=True)
+        self._all_checked = state
         self._update_info()
 
+    def _select_all(self):
+        self._set_all_checked(True)
+
     def _deselect_all(self):
-        for iid in self._tree.get_children(""):
-            self._set_check(iid, False, propagate=True)
-        self._all_checked = False
-        self._update_info()
+        self._set_all_checked(False)
 
     def _on_search(self, *_):
         if self._parsed_root:
             self._populate_tree(self._parsed_root,
-                                search_term=self._search_var.get().strip())
+                                search_term=self._search_var.get().strip().lower())
 
     # ── Info panel ────────────────────────────
 
@@ -1491,12 +2655,18 @@ class CompareModeFrame(ttk.Frame):
         self._colors            = colors
         self._root_a            = None
         self._root_b            = None
-        self._count_a           = 0    # cached total for file A (set on load)
-        self._count_b           = 0    # cached total for file B (set on load)
-        self._result_bookmarks  = []   # full list after last compare
-        self._check_vars        = {}   # iid → BooleanVar
-        self._node_map          = {}   # iid → bookmark dict
+        self._root_c            = None
+        self._count_a           = 0
+        self._count_b           = 0
+        self._count_c           = 0
+        self._result_bookmarks  = []
+        self._check_vars        = {}
+        self._node_map          = {}
         self._all_checked       = True
+        self._diff_view_active  = False
+        self._advanced_open     = False   # whether the advanced panel is visible
+        self._three_way_active  = False   # True when File C is loaded and 3-way mode is on
+        self._active_3way_mode  = "only_in_a"
         self._build_ui()
 
     # ── UI ───────────────────────────────────
@@ -1560,15 +2730,83 @@ class CompareModeFrame(ttk.Frame):
         self._mode_btns["only_in_a"].config(bg=c["accent"], fg="#ffffff",
                                             font=("Segoe UI", 10, "bold"))
 
+        # Advanced button — far right of mode bar
+        self._advanced_btn = tk.Button(ctrl, text="Advanced ▾",
+            bg=c["sel"], fg=c["text"],
+            font=("Segoe UI", 10), relief="flat", bd=0, padx=12, pady=6,
+            cursor="hand2", command=self._toggle_advanced)
+        self._advanced_btn.pack(side=tk.RIGHT)
+
+        # ── Advanced / 3-way panel (hidden by default) ────────────────────
+        self._advanced_panel = ttk.Frame(self, style="Panel.TFrame", padding=10)
+        # not packed yet
+
+        adv_top = ttk.Frame(self._advanced_panel, style="Panel.TFrame")
+        adv_top.pack(fill=tk.X)
+        ttk.Label(adv_top, text="3-WAY COMPARE", style="PanelSub.TLabel").pack(side=tk.LEFT)
+        ttk.Label(adv_top,
+            text="Load a third file and find what's unique to each or common across all three.",
+            style="PanelSub.TLabel").pack(side=tk.LEFT, padx=(10, 0))
+
+        # File C loader
+        file_c_panel = ttk.Frame(self._advanced_panel, style="Panel.TFrame")
+        file_c_panel.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(file_c_panel, text="FILE C", style="PanelSub.TLabel").pack(anchor="w")
+        self._label_c = ttk.Label(file_c_panel, text="No file loaded", style="Panel.TLabel")
+        self._label_c.pack(anchor="w", pady=(2, 6))
+        btn_row = ttk.Frame(file_c_panel, style="Panel.TFrame")
+        btn_row.pack(anchor="w")
+        ttk.Button(btn_row, text="⊕  Open File C", style="Accent.TButton",
+                   command=lambda: self._load_file("C")).pack(side=tk.LEFT, padx=(0, 8))
+        self._clear_c_btn = ttk.Button(btn_row, text="✕  Remove File C", style="Ghost.TButton",
+                   command=self._clear_file_c)
+        self._clear_c_btn.pack(side=tk.LEFT)
+        self._clear_c_btn.config(state=tk.DISABLED)
+
+        # 3-way mode buttons
+        mode3_row = ttk.Frame(self._advanced_panel, style="Panel.TFrame")
+        mode3_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(mode3_row, text="Show:", style="App.TLabel").pack(side=tk.LEFT, padx=(0, 8))
+
+        self._mode3_btns  = {}
+        self._active_3way_mode = "3_only_a"
+
+        for label, val in [
+            ("Only in A",       "3_only_a"),
+            ("Only in B",       "3_only_b"),
+            ("Only in C",       "3_only_c"),
+            ("In all three",    "3_in_all"),
+            ("In A & B only",   "3_ab_only"),
+            ("In A & C only",   "3_ac_only"),
+            ("In B & C only",   "3_bc_only"),
+            ("Unique (not in all)", "3_not_all"),
+        ]:
+            btn = tk.Button(mode3_row, text=label,
+                            bg=c["sel"], fg=c["text"],
+                            font=("Segoe UI", 9),
+                            relief="flat", bd=0, padx=10, pady=5,
+                            cursor="hand2",
+                            command=lambda v=val: self._select_3way_mode(v))
+            btn.pack(side=tk.LEFT, padx=(0, 3))
+            self._mode3_btns[val] = btn
+
         # ── Results panel ────────────────────
         res_outer = ttk.Frame(self, style="Panel.TFrame", padding=4)
         res_outer.pack(fill=tk.BOTH, expand=True)
+        self._res_outer_ref = res_outer
 
         rh = ttk.Frame(res_outer, style="Panel.TFrame")
         rh.pack(fill=tk.X, padx=4, pady=(4, 2))
         ttk.Label(rh, text="COMPARISON RESULTS", style="PanelSub.TLabel").pack(side=tk.LEFT)
         self._res_count = ttk.Label(rh, text="", style="PanelSub.TLabel")
-        self._res_count.pack(side=tk.RIGHT)
+        self._res_count.pack(side=tk.RIGHT, padx=(8, 0))
+
+        # Toggle diff view button
+        self._diff_toggle_btn = tk.Button(rh, text="⇔  Diff View",
+            bg=c["sel"], fg=c["text"],
+            font=("Segoe UI", 9), relief="flat", bd=0, padx=10, pady=3,
+            cursor="hand2", command=self._toggle_diff_view)
+        self._diff_toggle_btn.pack(side=tk.RIGHT, padx=(0, 4))
 
         # Select all / deselect all buttons
         sel_bar = ttk.Frame(res_outer, style="Panel.TFrame")
@@ -1598,10 +2836,12 @@ class CompareModeFrame(ttk.Frame):
                   cursor="hand2")
         self._res_search_clear.pack(side=tk.LEFT, padx=(4, 0))
 
+        # ── List view (default) ───────────────────────────────────────────
+        self._list_view_frame = ttk.Frame(res_outer, style="Panel.TFrame")
+        self._list_view_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
         # columns: check | source | url
-        # #0 = Name tree column, #1 = check, #2 = source, #3 = url
-        rf = ttk.Frame(res_outer, style="Panel.TFrame")
-        rf.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        rf = self._list_view_frame
 
         self._res_tree = ttk.Treeview(rf, columns=("check", "source", "url"),
                                       show="tree headings", selectmode="extended")
@@ -1615,9 +2855,10 @@ class CompareModeFrame(ttk.Frame):
         self._res_tree.column("source",  width=62,  stretch=False, anchor="center")
         self._res_tree.column("url",     width=380, stretch=True)
 
-        # Tag colours for A / B badges
+        # Tag colours for A / B / C badges
         self._res_tree.tag_configure("src_a",  foreground="#1d4ed8", font=("Segoe UI", 10, "bold"))
         self._res_tree.tag_configure("src_b",  foreground="#15803d", font=("Segoe UI", 10, "bold"))
+        self._res_tree.tag_configure("src_c",  foreground="#7c3aed", font=("Segoe UI", 10, "bold"))
         self._res_tree.tag_configure("src_ab", foreground="#64748b", font=("Segoe UI", 10, "bold"))
 
         vsb = ttk.Scrollbar(rf, orient=tk.VERTICAL,   command=self._res_tree.yview)
@@ -1631,6 +2872,80 @@ class CompareModeFrame(ttk.Frame):
 
         # Bind click on check column (#1)
         self._res_tree.bind("<Button-1>", self._on_res_click)
+
+        # ── Diff view (hidden until toggled) ─────────────────────────────
+        self._diff_view_frame = ttk.Frame(res_outer, style="Panel.TFrame")
+        # not packed yet; shown by _toggle_diff_view
+        self._diff_view_frame.columnconfigure(0, weight=1)
+        self._diff_view_frame.columnconfigure(1, weight=1)
+        self._diff_view_frame.rowconfigure(1, weight=1)
+
+        # Column headers
+        self._diff_hdr_a = tk.Label(self._diff_view_frame,
+            text="FILE A", bg="#fee2e2", fg="#991b1b",
+            font=("Segoe UI", 9, "bold"), padx=8, pady=4, anchor="w")
+        self._diff_hdr_a.grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=(0, 2))
+
+        self._diff_hdr_b = tk.Label(self._diff_view_frame,
+            text="FILE B", bg="#dcfce7", fg="#166534",
+            font=("Segoe UI", 9, "bold"), padx=8, pady=4, anchor="w")
+        self._diff_hdr_b.grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
+
+        # Left treeview — File A
+        frame_a = ttk.Frame(self._diff_view_frame, style="Panel.TFrame")
+        frame_a.grid(row=1, column=0, sticky="nsew", padx=(0, 2))
+        frame_a.rowconfigure(0, weight=1)
+        frame_a.columnconfigure(0, weight=1)
+
+        self._diff_tree_a = ttk.Treeview(frame_a, columns=("check", "url"),
+                                          show="tree headings", selectmode="extended")
+        self._diff_tree_a.heading("#0",    text="Name (File A)")
+        self._diff_tree_a.heading("check", text="✓",
+                                   command=lambda: self._diff_toggle_all("A"))
+        self._diff_tree_a.heading("url",   text="URL")
+        self._diff_tree_a.column("#0",     width=200, stretch=True)
+        self._diff_tree_a.column("check",  width=40,  stretch=False, anchor="center")
+        self._diff_tree_a.column("url",    width=220, stretch=True)
+        self._diff_tree_a.tag_configure("only_a", background="#fee2e2", foreground="#991b1b")
+        self._diff_tree_a.tag_configure("shared", foreground="#64748b")
+
+        vsb_a = ttk.Scrollbar(frame_a, orient=tk.VERTICAL, command=self._diff_tree_a.yview)
+        self._diff_tree_a.configure(yscrollcommand=vsb_a.set)
+        self._diff_tree_a.grid(row=0, column=0, sticky="nsew")
+        vsb_a.grid(row=0, column=1, sticky="ns")
+        self._diff_tree_a.bind("<Button-1>", lambda e: self._on_diff_click(e, "A"))
+
+        # Right treeview — File B
+        frame_b = ttk.Frame(self._diff_view_frame, style="Panel.TFrame")
+        frame_b.grid(row=1, column=1, sticky="nsew", padx=(2, 0))
+        frame_b.rowconfigure(0, weight=1)
+        frame_b.columnconfigure(0, weight=1)
+
+        self._diff_tree_b = ttk.Treeview(frame_b, columns=("check", "url"),
+                                          show="tree headings", selectmode="extended")
+        self._diff_tree_b.heading("#0",    text="Name (File B)")
+        self._diff_tree_b.heading("check", text="✓",
+                                   command=lambda: self._diff_toggle_all("B"))
+        self._diff_tree_b.heading("url",   text="URL")
+        self._diff_tree_b.column("#0",     width=200, stretch=True)
+        self._diff_tree_b.column("check",  width=40,  stretch=False, anchor="center")
+        self._diff_tree_b.column("url",    width=220, stretch=True)
+        self._diff_tree_b.tag_configure("only_b", background="#dcfce7", foreground="#166534")
+        self._diff_tree_b.tag_configure("shared", foreground="#64748b")
+
+        vsb_b = ttk.Scrollbar(frame_b, orient=tk.VERTICAL, command=self._diff_tree_b.yview)
+        self._diff_tree_b.configure(yscrollcommand=vsb_b.set)
+        self._diff_tree_b.grid(row=0, column=0, sticky="nsew")
+        vsb_b.grid(row=0, column=1, sticky="ns")
+        self._diff_tree_b.bind("<Button-1>", lambda e: self._on_diff_click(e, "B"))
+
+        # Per-side check state: iid → BooleanVar
+        self._diff_check_a: dict = {}
+        self._diff_check_b: dict = {}
+        self._diff_node_a:  dict = {}   # iid → bookmark dict
+        self._diff_node_b:  dict = {}
+        self._diff_all_a = True
+        self._diff_all_b = True
 
         # Bottom bar
         bottom = ttk.Frame(self, style="App.TFrame")
@@ -1684,20 +2999,33 @@ class CompareModeFrame(ttk.Frame):
         threading.Thread(target=_load, daemon=True).start()
 
     def _on_file_loaded(self, which, path, root):
-        name = os.path.basename(path)
-        count = count_bookmarks(root.get("children", []))   # compute once on load
+        name  = os.path.basename(path)
+        count = count_bookmarks(root.get("children", []))
         if which == "A":
             self._root_a  = root
             self._count_a = count
             self._label_a.config(text=f"✔  {name}")
-        else:
+        elif which == "B":
             self._root_b  = root
             self._count_b = count
             self._label_b.config(text=f"✔  {name}")
+        else:  # C
+            self._root_c  = root
+            self._count_c = count
+            self._label_c.config(text=f"✔  {name}")
+            self._clear_c_btn.config(state=tk.NORMAL)
+            # Auto-activate 3-way mode with the current 3-way mode selection
+            self._three_way_active = True
+            c = self._colors
+            for v, btn in self._mode3_btns.items():
+                if v == self._active_3way_mode:
+                    btn.config(bg=c["accent2"], fg="#ffffff", font=("Segoe UI", 9, "bold"))
+                else:
+                    btn.config(bg=c["sel"], fg=c["text"], font=("Segoe UI", 9))
+            for btn in self._mode_btns.values():
+                btn.config(bg=c["sel"], fg=c["subtext"], font=("Segoe UI", 10))
         self._cmp_status.set(
-            f"File {which} loaded ({count} bookmarks). "
-            "Click ⇌ Compare when both files are ready.")
-        # Auto-run if both files are now loaded
+            f"File {which} loaded ({count} bookmarks).")
         if self._root_a and self._root_b:
             self._run_compare()
 
@@ -1705,7 +3033,11 @@ class CompareModeFrame(ttk.Frame):
 
     def _select_mode(self, val):
         c = self._colors
-        # Update button highlight
+        # Switch off 3-way mode
+        self._three_way_active = False
+        for v, btn in self._mode3_btns.items():
+            btn.config(bg=c["sel"], fg=c["text"], font=("Segoe UI", 9))
+        # Update 2-way button highlight
         for v, btn in self._mode_btns.items():
             if v == val:
                 btn.config(bg=c["accent"], fg="#ffffff",
@@ -1714,7 +3046,6 @@ class CompareModeFrame(ttk.Frame):
                 btn.config(bg=c["sel"], fg=c["text"],
                            font=("Segoe UI", 10))
         self._active_mode = val
-        # Auto-run if both files loaded
         if self._root_a and self._root_b:
             self._run_compare()
         else:
@@ -1725,9 +3056,180 @@ class CompareModeFrame(ttk.Frame):
                 f"Mode set. Load file{'s' if len(missing)>1 else ''} "
                 f"{' and '.join(missing)} to compare.")
 
+    # ── Diff view toggle ──────────────────────
+
+    def _toggle_diff_view(self):
+        c = self._colors
+        self._diff_view_active = not self._diff_view_active
+        if self._diff_view_active:
+            self._list_view_frame.pack_forget()
+            self._diff_view_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+            self._diff_toggle_btn.config(text="☰  List View",
+                                         bg=c["accent"], fg="#ffffff")
+            if self._root_a and self._root_b:
+                self._populate_diff_view()
+        else:
+            self._diff_view_frame.pack_forget()
+            self._list_view_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+            self._diff_toggle_btn.config(text="⇔  Diff View",
+                                         bg=c["sel"], fg=c["text"])
+
+    def _populate_diff_view(self, filter_term=""):
+        """Populate the two side-by-side diff Treeviews, mirroring the active compare mode."""
+        ft    = filter_term.lower()
+        mode  = self._active_mode
+        bm_a  = collect_all_bookmarks(self._root_a) if self._root_a else []
+        bm_b  = collect_all_bookmarks(self._root_b) if self._root_b else []
+        set_a = {normalise_url(b["href"]) for b in bm_a}
+        set_b = {normalise_url(b["href"]) for b in bm_b}
+
+        def matches(bm):
+            return (not ft or ft in (bm.get("name") or "").lower()
+                    or ft in (bm.get("href") or "").lower())
+
+        # Mirror exactly what _run_compare puts in each source column
+        if mode == "only_in_a":
+            items_a = [b for b in bm_a if normalise_url(b["href"]) not in set_b]
+            items_b = []
+            tag_a, tag_b = "only_a", "only_b"
+        elif mode == "only_in_b":
+            items_a = []
+            items_b = [b for b in bm_b if normalise_url(b["href"]) not in set_a]
+            tag_a, tag_b = "only_a", "only_b"
+        elif mode == "in_both":
+            items_a = [b for b in bm_a if normalise_url(b["href"]) in set_b]
+            items_b = [b for b in bm_b if normalise_url(b["href"]) in set_a]
+            tag_a, tag_b = "shared", "shared"
+        else:  # not_in_both
+            items_a = [b for b in bm_a if normalise_url(b["href"]) not in set_b]
+            items_b = [b for b in bm_b if normalise_url(b["href"]) not in set_a]
+            tag_a, tag_b = "only_a", "only_b"
+
+        def fill(tree, check_map, node_map, items, tag):
+            tree.delete(*tree.get_children())
+            check_map.clear()
+            node_map.clear()
+            for bm in items:
+                if not matches(bm):
+                    continue
+                var = tk.BooleanVar(value=True)
+                iid = tree.insert("", "end",
+                          text=f"  🔖  {bm.get('name') or '(unnamed)'}",
+                          values=("☑", bm.get("href") or ""),
+                          tags=(tag,))
+                check_map[iid] = var
+                node_map[iid]  = bm
+
+        fill(self._diff_tree_a, self._diff_check_a, self._diff_node_a, items_a, tag_a)
+        fill(self._diff_tree_b, self._diff_check_b, self._diff_node_b, items_b, tag_b)
+
+        self._diff_all_a = True
+        self._diff_all_b = True
+
+        ca = len([b for b in items_a if matches(b)])
+        cb = len([b for b in items_b if matches(b)])
+        mode_hdr = {
+            "only_in_a":   ("Only in A",  "—"),
+            "only_in_b":   ("—",          "Only in B"),
+            "in_both":     ("In both",    "In both"),
+            "not_in_both": ("Only in A",  "Only in B"),
+        }
+        la, lb = mode_hdr.get(mode, ("FILE A", "FILE B"))
+        self._diff_hdr_a.config(text=f"FILE A  —  {la}  ({ca} items)")
+        self._diff_hdr_b.config(text=f"FILE B  —  {lb}  ({cb} items)")
+
+    def _on_diff_click(self, event, side):
+        tree      = self._diff_tree_a if side == "A" else self._diff_tree_b
+        check_map = self._diff_check_a if side == "A" else self._diff_check_b
+        col = tree.identify_column(event.x)
+        iid = tree.identify_row(event.y)
+        if iid and col == "#1":   # check column
+            self._diff_toggle_item(iid, side)
+            return "break"
+
+    def _diff_toggle_item(self, iid, side, state=None):
+        check_map = self._diff_check_a if side == "A" else self._diff_check_b
+        tree      = self._diff_tree_a  if side == "A" else self._diff_tree_b
+        if iid not in check_map:
+            return
+        var       = check_map[iid]
+        new_state = state if state is not None else not var.get()
+        var.set(new_state)
+        vals = tree.item(iid, "values")
+        tree.item(iid, values=("☑" if new_state else "☐",
+                               vals[1] if len(vals) > 1 else ""))
+
+    def _diff_toggle_all(self, side):
+        if side == "A":
+            self._diff_all_a = not self._diff_all_a
+            new_state = self._diff_all_a
+            check_map = self._diff_check_a
+        else:
+            self._diff_all_b = not self._diff_all_b
+            new_state = self._diff_all_b
+            check_map = self._diff_check_b
+        for iid in check_map:
+            self._diff_toggle_item(iid, side, new_state)
+
+    # ── Advanced panel toggle ─────────────────
+
+    def _toggle_advanced(self):
+        c = self._colors
+        self._advanced_open = not self._advanced_open
+        if self._advanced_open:
+            self._advanced_panel.pack(fill=tk.X, pady=(0, 6),
+                                      before=self._res_outer_ref)
+            self._advanced_btn.config(text="Advanced ▴", bg=c["accent"], fg="#ffffff")
+        else:
+            self._advanced_panel.pack_forget()
+            self._advanced_btn.config(text="Advanced ▾", bg=c["sel"], fg=c["text"])
+
+    def _clear_file_c(self):
+        self._root_c  = None
+        self._count_c = 0
+        self._label_c.config(text="No file loaded")
+        self._clear_c_btn.config(state=tk.DISABLED)
+        self._three_way_active = False
+        # Deactivate all 3-way mode buttons
+        c = self._colors
+        for btn in self._mode3_btns.values():
+            btn.config(bg=c["sel"], fg=c["subtext"])
+        self._cmp_status.set("File C removed. Using 2-way comparison.")
+        if self._root_a and self._root_b:
+            self._run_compare()
+
+    # ── 3-way mode selection ──────────────────
+
+    def _select_3way_mode(self, val):
+        if not self._root_c:
+            messagebox.showwarning("No File C", "Load File C first to use 3-way compare.")
+            return
+        c = self._colors
+        for v, btn in self._mode3_btns.items():
+            if v == val:
+                btn.config(bg=c["accent2"], fg="#ffffff", font=("Segoe UI", 9, "bold"))
+            else:
+                btn.config(bg=c["sel"], fg=c["text"], font=("Segoe UI", 9))
+        # Deactivate 2-way mode buttons visually
+        for btn in self._mode_btns.values():
+            btn.config(bg=c["sel"], fg=c["subtext"], font=("Segoe UI", 10))
+        self._active_3way_mode = val
+        self._three_way_active = True
+        self._run_compare()
+
     # ── Comparison ───────────────────────────
 
     def _run_compare(self):
+        if self._three_way_active and self._root_c:
+            self._run_3way_compare()
+            return
+        if not self._root_a or not self._root_b:
+            messagebox.showwarning("Missing Files",
+                                   "Please load both File A and File B first.")
+            return
+        self._run_2way_compare()
+
+    def _run_2way_compare(self):
         if not self._root_a or not self._root_b:
             messagebox.showwarning("Missing Files",
                                    "Please load both File A and File B first.")
@@ -1754,9 +3256,70 @@ class CompareModeFrame(ttk.Frame):
         self._result_bookmarks = result
         self._populate_results(result)
 
+    def _run_3way_compare(self):
+        bm_a = collect_all_bookmarks(self._root_a)
+        bm_b = collect_all_bookmarks(self._root_b)
+        bm_c = collect_all_bookmarks(self._root_c)
+        set_a = {normalise_url(b["href"]) for b in bm_a}
+        set_b = {normalise_url(b["href"]) for b in bm_b}
+        set_c = {normalise_url(b["href"]) for b in bm_c}
+
+        mode = self._active_3way_mode
+        if mode == "3_only_a":
+            result = [dict(b, _source="A") for b in bm_a
+                      if normalise_url(b["href"]) not in set_b
+                      and normalise_url(b["href"]) not in set_c]
+        elif mode == "3_only_b":
+            result = [dict(b, _source="B") for b in bm_b
+                      if normalise_url(b["href"]) not in set_a
+                      and normalise_url(b["href"]) not in set_c]
+        elif mode == "3_only_c":
+            result = [dict(b, _source="C") for b in bm_c
+                      if normalise_url(b["href"]) not in set_a
+                      and normalise_url(b["href"]) not in set_b]
+        elif mode == "3_in_all":
+            result = [dict(b, _source="A+B+C") for b in bm_a
+                      if normalise_url(b["href"]) in set_b
+                      and normalise_url(b["href"]) in set_c]
+        elif mode == "3_ab_only":
+            result = [dict(b, _source="A+B") for b in bm_a
+                      if normalise_url(b["href"]) in set_b
+                      and normalise_url(b["href"]) not in set_c]
+        elif mode == "3_ac_only":
+            result = [dict(b, _source="A+C") for b in bm_a
+                      if normalise_url(b["href"]) in set_c
+                      and normalise_url(b["href"]) not in set_b]
+        elif mode == "3_bc_only":
+            result = [dict(b, _source="B+C") for b in bm_b
+                      if normalise_url(b["href"]) in set_c
+                      and normalise_url(b["href"]) not in set_a]
+        else:  # 3_not_all — unique to each file (not shared across all three)
+            only_a = [dict(b, _source="A") for b in bm_a
+                      if normalise_url(b["href"]) not in set_b
+                      or normalise_url(b["href"]) not in set_c]
+            only_b = [dict(b, _source="B") for b in bm_b
+                      if normalise_url(b["href"]) not in set_a
+                      or normalise_url(b["href"]) not in set_c]
+            only_c = [dict(b, _source="C") for b in bm_c
+                      if normalise_url(b["href"]) not in set_a
+                      or normalise_url(b["href"]) not in set_b]
+            result = only_a + only_b + only_c
+
+        self._result_bookmarks = result
+        self._populate_results(result, mode_label_override=
+            {"3_only_a":  "unique to File A (not in B or C)",
+             "3_only_b":  "unique to File B (not in A or C)",
+             "3_only_c":  "unique to File C (not in A or B)",
+             "3_in_all":  "present in all three files",
+             "3_ab_only": "in A & B only (not in C)",
+             "3_ac_only": "in A & C only (not in B)",
+             "3_bc_only": "in B & C only (not in A)",
+             "3_not_all": "not shared across all three files",
+            }.get(mode, ""))
+
     # ── Results tree ─────────────────────────
 
-    def _populate_results(self, bookmarks, filter_term=""):
+    def _populate_results(self, bookmarks, filter_term="", mode_label_override=None):
         self._res_tree.delete(*self._res_tree.get_children())
         self._check_vars.clear()
         self._node_map.clear()
@@ -1765,12 +3328,14 @@ class CompareModeFrame(ttk.Frame):
         for bm in bookmarks:
             name   = bm.get("name") or "(unnamed)"
             href   = bm.get("href") or ""
-            source = bm.get("_source", "")          # "A", "B", or ""
+            source = bm.get("_source", "")
             if ft and ft not in name.lower() and ft not in href.lower():
                 continue
             var = tk.BooleanVar(value=True)
-            badge    = f"[{source}]" if source else ""
-            src_tag  = {"A": "src_a", "B": "src_b", "A+B": "src_ab"}.get(source, "")
+            badge   = f"[{source}]" if source else ""
+            src_tag = {"A": "src_a", "B": "src_b", "A+B": "src_ab",
+                       "C": "src_c", "A+C": "src_ab", "B+C": "src_ab",
+                       "A+B+C": "src_ab"}.get(source, "")
             iid = self._res_tree.insert("", "end",
                       text=f"  🔖  {name}",
                       values=("☑", badge, href),
@@ -1781,24 +3346,31 @@ class CompareModeFrame(ttk.Frame):
         count = len(self._node_map)
         self._res_count.config(text=f"{count} bookmarks")
 
-        mode = self._active_mode
-        mode_labels = {
-            "only_in_a":   "unique to File A",
-            "only_in_b":   "unique to File B",
-            "in_both":     "present in both files",
-            "not_in_both": "unique across both files (non-matching)",
-        }
-        total_a = self._count_a
-        total_b = self._count_b
-        self._cmp_status.set(
-            f"Found {count} bookmarks {mode_labels.get(mode, '')}  "
-            f"(A: {total_a} total  |  B: {total_b} total)")
+        if mode_label_override is not None:
+            label = mode_label_override
+        else:
+            label = {
+                "only_in_a":   "unique to File A",
+                "only_in_b":   "unique to File B",
+                "in_both":     "present in both files",
+                "not_in_both": "unique across both files (non-matching)",
+            }.get(self._active_mode, "")
+
+        totals = f"A: {self._count_a}"
+        if self._count_b: totals += f"  |  B: {self._count_b}"
+        if self._count_c: totals += f"  |  C: {self._count_c}"
+        self._cmp_status.set(f"Found {count} bookmarks {label}  ({totals})")
         self._all_checked = True
+        # If diff view is currently visible, rebuild it with the same filter
+        if self._diff_view_active:
+            self._populate_diff_view(filter_term=filter_term)
 
     def _on_res_search(self, *_):
+        ft = self._res_search_var.get().strip()
         if self._result_bookmarks:
-            self._populate_results(self._result_bookmarks,
-                                   filter_term=self._res_search_var.get().strip())
+            self._populate_results(self._result_bookmarks, filter_term=ft)
+        elif self._diff_view_active and self._root_a and self._root_b:
+            self._populate_diff_view(filter_term=ft)
 
     # ── Check interactions ────────────────────
 
@@ -1830,14 +3402,30 @@ class CompareModeFrame(ttk.Frame):
                     vals[2] if len(vals) > 2 else ""))
 
     def _select_all_results(self):
-        for iid in self._check_vars:
-            self._toggle_result(iid, True)
-        self._all_checked = True
+        if self._diff_view_active:
+            for iid in self._diff_check_a:
+                self._diff_toggle_item(iid, "A", True)
+            for iid in self._diff_check_b:
+                self._diff_toggle_item(iid, "B", True)
+            self._diff_all_a = True
+            self._diff_all_b = True
+        else:
+            for iid in self._check_vars:
+                self._toggle_result(iid, True)
+            self._all_checked = True
 
     def _deselect_all_results(self):
-        for iid in self._check_vars:
-            self._toggle_result(iid, False)
-        self._all_checked = False
+        if self._diff_view_active:
+            for iid in self._diff_check_a:
+                self._diff_toggle_item(iid, "A", False)
+            for iid in self._diff_check_b:
+                self._diff_toggle_item(iid, "B", False)
+            self._diff_all_a = False
+            self._diff_all_b = False
+        else:
+            for iid in self._check_vars:
+                self._toggle_result(iid, False)
+            self._all_checked = False
 
     # ── Export ────────────────────────────────
 
@@ -1912,6 +3500,11 @@ class CompareModeFrame(ttk.Frame):
                 btn.config(bg=c["accent"], fg="#ffffff")
             else:
                 btn.config(bg=c["sel"], fg=c["text"])
+        # Diff toggle button
+        if self._diff_view_active:
+            self._diff_toggle_btn.config(bg=c["accent"], fg="#ffffff")
+        else:
+            self._diff_toggle_btn.config(bg=c["sel"], fg=c["text"])
 
 
 # ─────────────────────────────────────────────
