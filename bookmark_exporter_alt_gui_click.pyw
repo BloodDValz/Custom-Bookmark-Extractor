@@ -2871,12 +2871,12 @@ class CompareModeFrame(ttk.Frame):
             if which == "A": self._panel_a = panel
             else:            self._panel_b = panel
             btn_row_ab = ttk.Frame(panel, style="Panel.TFrame")
-            btn_row_ab.pack(anchor="w")
+            btn_row_ab.pack(fill=tk.X)
             ttk.Button(btn_row_ab, text=f"⊕  Open File {which}", style="Accent.TButton",
-                       command=lambda w=which: self._load_file(w)).pack(side=tk.LEFT, padx=(0, 8))
+                       command=lambda w=which: self._load_file(w)).pack(side=tk.LEFT)
             clear_btn = ttk.Button(btn_row_ab, text=f"✕  Remove File {which}", style="Ghost.TButton",
                        command=lambda w=which: self._clear_file_ab(w))
-            clear_btn.pack(side=tk.LEFT)
+            clear_btn.pack(side=tk.RIGHT)
             clear_btn.config(state=tk.DISABLED)
             setattr(self, attr_clear, clear_btn)
             if which == "A":
