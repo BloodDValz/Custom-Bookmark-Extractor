@@ -8,6 +8,8 @@ Built with Tkinter, this tool helps you organize bookmarks, clean exports, find 
 
 ### ◈ Normal Mode
 - Load an exported browser bookmark HTML file
+- **Remove File** — clear the loaded file and reset the view at any time using the Remove File button (sits left of the Filter button in the toolbar)
+- **Drag-and-drop** a bookmark HTML file directly onto the window to load it (Windows native, no extra install required)
 - Browse bookmarks in a full tree structure (folders + links)
   - Folders display a bookmark count in parentheses next to their name
 - Search bookmarks by name or URL (live filtering)
@@ -17,6 +19,7 @@ Built with Tkinter, this tool helps you organize bookmarks, clean exports, find 
 - Select All / Deselect All with one click (or via the column heading)
 - **Drag-to-reorder** bookmarks and folders within the tree
   - Toggle a lock/unlock button to enable or disable reordering
+  - The rearranged order is fully preserved on export
 - **Undo / Redo** — unlimited undo and redo for all tree changes (reordering, check toggles, bulk renames)
 - **Breadcrumb bar** — shows the full folder path of the selected item; folder segments are clickable and jump to that folder in the tree
 - **Jump to Folder** (`Ctrl+G`) — type-to-filter dialog listing all folders; arrow keys navigate, Enter jumps to the selection
@@ -34,9 +37,12 @@ Built with Tkinter, this tool helps you organize bookmarks, clean exports, find 
 - Export selected bookmarks (preserving folder structure) to a clean Netscape HTML file
   - `ADD_DATE` is preserved in all exports
 - Non-blocking file loading — large files are parsed on a background thread so the UI stays responsive
+- `Space` toggles the check state of all selected items; `Ctrl+A` selects all visible tree items; `Shift+Up` / `Shift+Down` extend the selection
 
 ### ⊕ Duplicates Mode
 - Load a single bookmark file and automatically detect all URLs that appear more than once
+- **Remove File** — clear the loaded file and reset the view at any time using the Remove File button (sits left of the Export Duplicates Only button)
+- **Drag-and-drop** a bookmark HTML file directly onto the window to load it (Windows native, no extra install required)
 - Duplicates are grouped by normalised URL (case-insensitive, trailing slash stripped, tracking parameters removed)
 - Each group shows how many copies exist and which folder each copy lives in
 - Toolbar quick-actions:
@@ -52,6 +58,8 @@ Built with Tkinter, this tool helps you organize bookmarks, clean exports, find 
 
 ### ⇌ Compare Mode
 - Load two separate bookmark HTML files (File A and File B)
+- **Remove File A / B** — each file panel has its own Remove button sitting next to its Open button; removing a file automatically clears the comparison results and the Diff View
+- **Drag-and-drop** bookmark HTML files directly onto the File A, File B, or File C panels to load them (Windows native, no extra install required)
 - **Swap Files (⇄)** — swap File A and File B and immediately re-run the comparison
 - Compare by URL only (case-insensitive, trailing slash ignored) — bookmark titles are not used for matching
 - Four comparison views, switchable at any time:
@@ -122,6 +130,7 @@ Modules used:
 - `html.parser`
 - `urllib.parse`
 - `collections`
+- `ctypes` (Windows drag-and-drop support)
 - `datetime`
 - `threading`
 - `typing`
@@ -133,13 +142,13 @@ Modules used:
 
 ### Standard Python file:
 ```bash
-python bookmark_comparison_gui_click.pyw
+python bookmark_exporter_gui_click.pyw
 ```
 
 ### Windowless (Windows — `.pyw` extension suppresses the console):
-Double-click `bookmark_comparison_gui_click.pyw` directly, or run:
+Double-click `bookmark_exporter_gui_click.pyw` directly, or run:
 ```bash
-pythonw bookmark_comparison_gui_click.pyw
+pythonw bookmark_exporter_gui_click.pyw
 ```
 
 ---
