@@ -57,8 +57,11 @@ if _sys.platform == "win32":
 
     def _extract_drop_path(hdrop):
         """Return the first file path from a HDROP handle."""
-        buf = _ctypes.create_unicode_buffer(260)
-        _shell32.DragQueryFileW(hdrop, 0, buf, 260)
+        # MAX_PATH on Windows is 260 chars, but extended-length paths can reach
+        # 32 767 chars.  Use 32 768 to handle both safely.
+        _BUF = 32768
+        buf = _ctypes.create_unicode_buffer(_BUF)
+        _shell32.DragQueryFileW(hdrop, 0, buf, _BUF)
         _shell32.DragFinish(hdrop)
         return buf.value
 
@@ -218,10 +221,12 @@ class BookmarkParser(HTMLParser):
         attrs = dict(attrs)
         self._current_tag = tag.upper()
         if tag.upper() == "DL":
-            # Create a folder even if no preceding <H3>; fall back to "(unnamed)"
-            # Only push a new folder if we have a pending name OR we're below root
-            if self._pending_folder_name is not None:
-                folder_name = self._pending_folder_name or "(unnamed)"
+            # Always push a new folder node.  If no <H3> preceded this <DL>
+            # (e.g. the root <DL> or a bare nested list), use "(unnamed)" so
+            # that bookmarks inside are never silently lost.
+            if len(self._stack) > 1 or self._pending_folder_name is not None:
+                folder_name = self._pending_folder_name if self._pending_folder_name is not None else "(unnamed)"
+                folder_name = folder_name or "(unnamed)"
                 folder: FolderNode = {
                     "type":     "folder",
                     "name":     folder_name,
@@ -231,7 +236,7 @@ class BookmarkParser(HTMLParser):
                 }
                 self._stack[-1]["children"].append(folder)
                 self._stack.append(folder)
-                self._pending_folder_name = None
+            self._pending_folder_name = None
         elif tag.upper() == "H3":
             self._pending_folder_name = ""
         elif tag.upper() == "A":
@@ -926,6 +931,7 @@ class NormalModeFrame(ttk.Frame):
                         self._tree.item(iid, text=f"  🔖  {s['name']}")
                 restore_children(iid, s["children"])
         restore_children("", snapshot)
+        self._recalculate_folder_bm_counts()
         self._refresh_folder_indicators()
         self._update_info()
 
@@ -934,6 +940,7 @@ class NormalModeFrame(ttk.Frame):
             return
         self._redo_stack.append(self._snapshot())
         self._restore_snapshot(self._undo_stack.pop())
+        self._sync_parsed_root_from_tree()
         self._refresh_undo_btns()
 
     def _redo(self):
@@ -941,11 +948,56 @@ class NormalModeFrame(ttk.Frame):
             return
         self._undo_stack.append(self._snapshot())
         self._restore_snapshot(self._redo_stack.pop())
+        self._sync_parsed_root_from_tree()
         self._refresh_undo_btns()
 
     def _refresh_undo_btns(self):
         self._undo_btn.config(state=tk.NORMAL if self._undo_stack else tk.DISABLED)
         self._redo_btn.config(state=tk.NORMAL if self._redo_stack else tk.DISABLED)
+
+    def _sync_parsed_root_from_tree(self):
+        """Rebuild _parsed_root["children"] to match the current tree order.
+
+        Called after every drag-and-drop move and after undo/redo so that
+        exports always reflect the rearranged layout rather than the original
+        parse order.
+        """
+        if not self._parsed_root:
+            return
+
+        def build_children(parent_iid):
+            children = []
+            for iid in self._tree.get_children(parent_iid):
+                node = self._node_map.get(iid)
+                if node is None:
+                    continue
+                if node["type"] == "folder":
+                    node = dict(node)
+                    node["children"] = build_children(iid)
+                children.append(node)
+            return children
+
+        self._parsed_root["children"] = build_children("")
+        self._recalculate_folder_bm_counts()
+
+    def _recalculate_folder_bm_counts(self):
+        """Recount and relabel every folder in the tree.
+
+        Called after drag-and-drop moves and undo/redo so the displayed counts
+        never drift from reality.
+        """
+        def update(iid):
+            for child_iid in self._tree.get_children(iid):
+                update(child_iid)
+            node = self._node_map.get(iid)
+            if node and node["type"] == "folder":
+                cnt = count_bookmarks(node.get("children", []))
+                self._folder_bm_counts[iid] = cnt
+                name = node.get("name") or "(unnamed)"
+                self._tree.item(iid, text=f"  📁  {name} ({cnt})")
+
+        for iid in self._tree.get_children(""):
+            update(iid)
 
     # ── Expand / Collapse ─────────────────────
 
@@ -1266,6 +1318,7 @@ class NormalModeFrame(ttk.Frame):
                 insert_at += 1
             self._tree.selection_set(*items_to_move)
             self._tree.see(items_to_move[0])
+            self._sync_parsed_root_from_tree()
 
         # If we had an indicator item, use its position directly
         if indicator_iid:
@@ -1299,6 +1352,7 @@ class NormalModeFrame(ttk.Frame):
             if items_to_move:
                 self._tree.selection_set(*items_to_move)
                 self._tree.see(items_to_move[0])
+            self._sync_parsed_root_from_tree()
         else:
             do_move(insert_parent, insert_idx)
 
@@ -1744,7 +1798,10 @@ class NormalModeFrame(ttk.Frame):
             if s.isdigit():
                 return int(s)
             try:
-                return int(datetime.strptime(s, "%Y-%m-%d").timestamp())
+                # Parse as UTC midnight so date comparisons are timezone-neutral.
+                import calendar
+                t = datetime.strptime(s, "%Y-%m-%d")
+                return calendar.timegm(t.timetuple())
             except Exception:
                 return None
 
@@ -2297,8 +2354,19 @@ class NormalModeFrame(ttk.Frame):
 
     def _on_search(self, *_):
         if self._parsed_root:
+            # Preserve undo/redo stacks — a search repopulates the tree with
+            # new iids, which would invalidate old snapshots.  We save/restore
+            # the stacks so they survive the rebuild (the snapshots contain
+            # node data, not just iids, so they remain meaningful).
+            saved_undo = list(self._undo_stack)
+            saved_redo = list(self._redo_stack)
             self._populate_tree(self._parsed_root,
                                 search_term=self._search_var.get().strip().lower())
+            self._undo_stack.clear()
+            self._undo_stack.extend(saved_undo)
+            self._redo_stack.clear()
+            self._redo_stack.extend(saved_redo)
+            self._refresh_undo_btns()
 
     # ── Info panel ────────────────────────────
 
@@ -3517,16 +3585,18 @@ class CompareModeFrame(ttk.Frame):
             result = [dict(b, _source="B+C") for b in bm_b
                       if normalise_url(b["href"]) in set_c
                       and normalise_url(b["href"]) not in set_a]
-        else:  # 3_not_all — unique to each file (not shared across all three)
+        else:  # 3_not_all — not present in ALL three files simultaneously
+            # A bookmark qualifies only when it is absent from at least one of
+            # the other two files (AND, not OR, avoids the duplicate-entry bug).
             only_a = [dict(b, _source="A") for b in bm_a
-                      if normalise_url(b["href"]) not in set_b
-                      or normalise_url(b["href"]) not in set_c]
+                      if not (normalise_url(b["href"]) in set_b
+                              and normalise_url(b["href"]) in set_c)]
             only_b = [dict(b, _source="B") for b in bm_b
-                      if normalise_url(b["href"]) not in set_a
-                      or normalise_url(b["href"]) not in set_c]
+                      if not (normalise_url(b["href"]) in set_a
+                              and normalise_url(b["href"]) in set_c)]
             only_c = [dict(b, _source="C") for b in bm_c
-                      if normalise_url(b["href"]) not in set_a
-                      or normalise_url(b["href"]) not in set_b]
+                      if not (normalise_url(b["href"]) in set_a
+                              and normalise_url(b["href"]) in set_b)]
             result = only_a + only_b + only_c
 
         self._result_bookmarks = result
@@ -3654,8 +3724,18 @@ class CompareModeFrame(ttk.Frame):
     # ── Export ────────────────────────────────
 
     def _export_results(self):
-        checked = [self._node_map[iid]
-                   for iid, var in self._check_vars.items() if var.get()]
+        # When Diff View is active, collect from the two side-by-side panels
+        # instead of the (empty) _check_vars dict that belongs to the list view.
+        if self._diff_view_active:
+            checked = (
+                [self._diff_node_a[iid]
+                 for iid, var in self._diff_check_a.items() if var.get()]
+                + [self._diff_node_b[iid]
+                   for iid, var in self._diff_check_b.items() if var.get()]
+            )
+        else:
+            checked = [self._node_map[iid]
+                       for iid, var in self._check_vars.items() if var.get()]
         if not checked:
             messagebox.showwarning("Nothing checked",
                                    "Check at least one bookmark to export.")
